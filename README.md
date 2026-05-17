@@ -1,13 +1,21 @@
-# FORCE_MIGRATION_V5
+# SESSION_CLEAN_V6
 
-Cette version affiche dans les logs Railway :
+Version qui supprime uniquement les messages de la session entre ouverture et fermeture.
 
-STARTING BOT VERSION: FORCE_MIGRATION_V5_2026_05_18
+## Fonctionnement
+
+- Ouvrir session crée une session.
+- Tous les messages envoyés pendant la session sont stockés avec session_id.
+- Fermer + effacer session supprime tous les messages de cette session.
+- Le message "Groupe ouvert" appartient à la session, donc il est supprimé à la fermeture.
+- Le message final "Groupe fermé" est envoyé après nettoyage, donc il reste seul.
+
+## Logs Railway attendus
+
+STARTING BOT VERSION: SESSION_CLEAN_V6_2026_05_18
 TABLES IN DATABASE: [...]
 
-Si tu ne vois pas cette ligne dans les logs, Railway ne déploie pas ce ZIP.
-
-## Variables Railway
+## Variables
 
 BOT_TOKEN=TON_NOUVEAU_TOKEN
 ADMIN_IDS=5296696302

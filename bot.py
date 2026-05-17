@@ -17,7 +17,7 @@ from telegram.ext import (
     filters,
 )
 
-APP_VERSION = "FORCE_MIGRATION_V5_2026_05_18"
+APP_VERSION = "SESSION_CLEAN_V6_2026_05_18"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
@@ -36,20 +36,10 @@ URL_RE = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/|discord\.gg/)", re.I
 async def init_db():
     global db_pool
 
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL missing")
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN missing")
-    if not WEBHOOK_URL:
-        raise RuntimeError("WEBHOOK_URL missing")
-
     print(f"STARTING BOT VERSION: {APP_VERSION}", flush=True)
-
     db_pool = await asyncpg.create_pool(DATABASE_URL)
 
     async with db_pool.acquire() as con:
-        print("CREATING TABLES...", flush=True)
-
         await con.execute("""
         CREATE TABLE IF NOT EXISTS settings(
             key TEXT PRIMARY KEY,
@@ -58,13 +48,32 @@ async def init_db():
         """)
 
         await con.execute("""
+        CREATE TABLE IF NOT EXISTS sessions(
+            id SERIAL PRIMARY KEY,
+            chat_id BIGINT NOT NULL,
+            opened_at TIMESTAMP DEFAULT NOW(),
+            closed_at TIMESTAMP
+        )
+        """)
+
+        await con.execute("""
         CREATE TABLE IF NOT EXISTS messages(
             chat_id BIGINT NOT NULL,
             message_id BIGINT NOT NULL,
             user_id BIGINT,
+            session_id INTEGER,
             is_bot BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT NOW(),
             PRIMARY KEY(chat_id, message_id)
+        )
+        """)
+
+        await con.execute("""
+        CREATE TABLE IF NOT EXISTS system_messages(
+            chat_id BIGINT PRIMARY KEY,
+            message_id BIGINT,
+            kind TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
         )
         """)
 
@@ -128,20 +137,6 @@ async def init_db():
         )
         """)
 
-        await con.execute("""
-        CREATE TABLE IF NOT EXISTS schema_version(
-            id INTEGER PRIMARY KEY,
-            version TEXT NOT NULL,
-            updated_at TIMESTAMP DEFAULT NOW()
-        )
-        """)
-
-        await con.execute("""
-        INSERT INTO schema_version(id, version, updated_at)
-        VALUES(1, $1, NOW())
-        ON CONFLICT(id) DO UPDATE SET version=$1, updated_at=NOW()
-        """, APP_VERSION)
-
         defaults = {
             "moderation": "on",
             "anti_links": "on",
@@ -151,6 +146,7 @@ async def init_db():
             "group_open": "off",
             "open_hour": "23",
             "close_hour": "1",
+            "current_session_id": "0",
         }
 
         for k, v in defaults.items():
@@ -160,8 +156,7 @@ async def init_db():
             )
 
         rows = await con.fetch("""
-        SELECT table_name
-        FROM information_schema.tables
+        SELECT table_name FROM information_schema.tables
         WHERE table_schema='public'
         ORDER BY table_name
         """)
@@ -179,7 +174,7 @@ async def set_setting(key, value):
         await con.execute("""
         INSERT INTO settings(key,value) VALUES($1,$2)
         ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value
-        """, key, value)
+        """, key, str(value))
 
 
 async def count_table(table):
@@ -187,30 +182,74 @@ async def count_table(table):
         return await con.fetchval(f"SELECT COUNT(*) FROM {table}")
 
 
-async def get_table_names():
+async def get_current_session_id():
+    sid = await get_setting("current_session_id", "0")
+    try:
+        return int(sid)
+    except Exception:
+        return 0
+
+
+async def create_open_session():
     async with db_pool.acquire() as con:
-        rows = await con.fetch("""
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema='public'
-        ORDER BY table_name
-        """)
-        return [r["table_name"] for r in rows]
+        sid = await con.fetchval(
+            "INSERT INTO sessions(chat_id) VALUES($1) RETURNING id",
+            GROUP_ID
+        )
+    await set_setting("current_session_id", sid)
+    return sid
 
 
-async def save_message_by_ids(chat_id, message_id, user_id=None, is_bot=False):
+async def close_current_session():
+    sid = await get_current_session_id()
+    if sid:
+        async with db_pool.acquire() as con:
+            await con.execute("UPDATE sessions SET closed_at=NOW() WHERE id=$1", sid)
+    await set_setting("current_session_id", "0")
+    return sid
+
+
+async def save_message_by_ids(chat_id, message_id, user_id=None, is_bot=False, session_id=None):
+    if session_id is None:
+        session_id = await get_current_session_id()
     async with db_pool.acquire() as con:
         await con.execute("""
-        INSERT INTO messages(chat_id,message_id,user_id,is_bot)
-        VALUES($1,$2,$3,$4)
+        INSERT INTO messages(chat_id,message_id,user_id,is_bot,session_id)
+        VALUES($1,$2,$3,$4,$5)
         ON CONFLICT DO NOTHING
-        """, chat_id, message_id, user_id, is_bot)
+        """, chat_id, message_id, user_id, is_bot, session_id)
 
 
-async def send_group_and_record(context: ContextTypes.DEFAULT_TYPE, text: str, **kwargs):
-    msg = await context.bot.send_message(GROUP_ID, text, **kwargs)
-    await save_message_by_ids(GROUP_ID, msg.message_id, None, True)
-    print(f"BOT MESSAGE SAVED: chat={GROUP_ID} message_id={msg.message_id}", flush=True)
+async def delete_last_system_message(context: ContextTypes.DEFAULT_TYPE):
+    async with db_pool.acquire() as con:
+        row = await con.fetchrow("SELECT message_id FROM system_messages WHERE chat_id=$1", GROUP_ID)
+
+    if row and row["message_id"]:
+        try:
+            await context.bot.delete_message(GROUP_ID, row["message_id"])
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            print(f"OLD SYSTEM DELETE FAILED: {e}", flush=True)
+
+    async with db_pool.acquire() as con:
+        await con.execute("DELETE FROM system_messages WHERE chat_id=$1", GROUP_ID)
+
+
+async def send_system_message(context: ContextTypes.DEFAULT_TYPE, text: str, kind: str, record_in_session=True):
+    await delete_last_system_message(context)
+    msg = await context.bot.send_message(GROUP_ID, text)
+
+    async with db_pool.acquire() as con:
+        await con.execute("""
+        INSERT INTO system_messages(chat_id,message_id,kind,created_at)
+        VALUES($1,$2,$3,NOW())
+        ON CONFLICT(chat_id) DO UPDATE SET message_id=$2, kind=$3, created_at=NOW()
+        """, GROUP_ID, msg.message_id, kind)
+
+    if record_in_session:
+        await save_message_by_ids(GROUP_ID, msg.message_id, None, True)
+
+    print(f"SYSTEM MESSAGE SAVED: {kind} {msg.message_id}", flush=True)
     return msg
 
 
@@ -256,8 +295,8 @@ async def main_panel_keyboard():
         [InlineKeyboardButton(f"♻️ Anti-repost {led(anti_repost)}", callback_data="toggle:anti_repost")],
         [InlineKeyboardButton(f"⏰ Auto horaires {led(auto_schedule)}", callback_data="toggle:auto_schedule")],
         [
-            InlineKeyboardButton("🟢 Ouvrir maintenant", callback_data="open_group"),
-            InlineKeyboardButton("🔴 Fermer + effacer", callback_data="close_group"),
+            InlineKeyboardButton("🟢 Ouvrir session", callback_data="open_group"),
+            InlineKeyboardButton("🔴 Fermer + effacer session", callback_data="close_group"),
         ],
         [InlineKeyboardButton("🚫 Mots interdits", callback_data="words_menu")],
         [InlineKeyboardButton(f"🎁 Vidéos {videos}/60 {video_led}", callback_data="videos_menu")],
@@ -285,6 +324,7 @@ async def build_status_text(extra=""):
         videos = await con.fetchval("SELECT COUNT(*) FROM reward_videos")
         msg_count = await con.fetchval("SELECT COUNT(*) FROM messages")
         words = await con.fetchval("SELECT COUNT(*) FROM banned_words")
+        sessions = await con.fetchval("SELECT COUNT(*) FROM sessions")
         moderation = await con.fetchval("SELECT value FROM settings WHERE key='moderation'")
         anti_links = await con.fetchval("SELECT value FROM settings WHERE key='anti_links'")
         anti_photo = await con.fetchval("SELECT value FROM settings WHERE key='anti_photo_mention'")
@@ -292,16 +332,16 @@ async def build_status_text(extra=""):
         auto_schedule = await con.fetchval("SELECT value FROM settings WHERE key='auto_schedule'")
         group_open = await con.fetchval("SELECT value FROM settings WHERE key='group_open'")
 
-    tables = await get_table_names()
+    sid = await get_current_session_id()
     video_ok = "✅" if videos >= 60 else "❌"
 
     text = (
         "⚙️ PANEL ADMIN\n\n"
         f"🧩 Version : {APP_VERSION}\n"
         "🗄️ Base PostgreSQL : ✅ branchée\n"
-        f"📋 Tables : {len(tables)}\n"
         f"👥 Groupe : {'✅' if GROUP_ID else '❌'} branché\n"
-        f"🚪 Groupe ouvert : {led(group_open)}\n\n"
+        f"🚪 Groupe ouvert : {led(group_open)}\n"
+        f"🧾 Session active : {sid if sid else 'aucune'}\n\n"
         f"🛡️ Modération : {led(moderation)}\n"
         f"🔗 Anti-liens : {led(anti_links)}\n"
         f"🖼️ Photo mention : {led(anti_photo)}\n"
@@ -309,6 +349,7 @@ async def build_status_text(extra=""):
         f"⏰ Auto horaires : {led(auto_schedule)}\n\n"
         f"🎁 Vidéos : {videos}/60 {video_ok}\n"
         f"💬 Messages stockés : {msg_count}\n"
+        f"🧾 Sessions : {sessions}\n"
         f"🚫 Mots interdits : {words}\n"
     )
     if extra:
@@ -361,12 +402,12 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "open_group":
         await open_group(context)
-        await show_panel(q, "groupe ouvert")
+        await show_panel(q, "session ouverte")
         return
 
     if data == "close_group":
         deleted = await close_group_and_clean(context)
-        await show_panel(q, f"groupe fermé, {deleted} messages supprimés")
+        await show_panel(q, f"session fermée, {deleted} messages supprimés")
         return
 
     if data == "words_menu":
@@ -403,7 +444,12 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def open_group(context: ContextTypes.DEFAULT_TYPE):
+    # Supprime l'ancien message système fermé/ouvert avant d'ouvrir
+    await delete_last_system_message(context)
+
+    sid = await create_open_session()
     await set_setting("group_open", "on")
+
     perms = ChatPermissions(
         can_send_messages=True,
         can_send_audios=True,
@@ -414,43 +460,78 @@ async def open_group(context: ContextTypes.DEFAULT_TYPE):
         can_send_voice_notes=True,
     )
     await context.bot.set_chat_permissions(GROUP_ID, perms)
-    await send_group_and_record(context, "🟢 Groupe ouvert, vous pouvez envoyer.")
+
+    # Le message d'ouverture est dans la session, donc il sera supprimé à la fermeture.
+    await send_system_message(context, "🟢 Groupe ouvert, vous pouvez envoyer.", "open", record_in_session=True)
+    print(f"OPEN SESSION: {sid}", flush=True)
 
 
 async def close_group_and_clean(context: ContextTypes.DEFAULT_TYPE):
+    sid = await get_current_session_id()
     await set_setting("group_open", "off")
+
     perms = ChatPermissions(can_send_messages=False)
     await context.bot.set_chat_permissions(GROUP_ID, perms)
 
-    async with db_pool.acquire() as con:
-        rows = await con.fetch("SELECT chat_id, message_id FROM messages WHERE chat_id=$1 ORDER BY created_at ASC", GROUP_ID)
+    if sid:
+        async with db_pool.acquire() as con:
+            rows = await con.fetch("""
+            SELECT chat_id, message_id
+            FROM messages
+            WHERE chat_id=$1 AND session_id=$2
+            ORDER BY created_at ASC
+            """, GROUP_ID, sid)
+    else:
+        async with db_pool.acquire() as con:
+            rows = await con.fetch("""
+            SELECT chat_id, message_id
+            FROM messages
+            WHERE chat_id=$1
+            ORDER BY created_at ASC
+            """, GROUP_ID)
 
-    print(f"CLOSING GROUP. MESSAGES TO DELETE: {len(rows)}", flush=True)
+    print(f"CLOSING SESSION {sid}. MESSAGES TO DELETE: {len(rows)}", flush=True)
 
     deleted = 0
     for row in rows:
         try:
             await context.bot.delete_message(row["chat_id"], row["message_id"])
             deleted += 1
-            await asyncio.sleep(0.03)
+            await asyncio.sleep(0.04)
         except Exception as e:
             print(f"DELETE FAILED message_id={row['message_id']} error={e}", flush=True)
 
-    async with db_pool.acquire() as con:
-        await con.execute("DELETE FROM messages WHERE chat_id=$1", GROUP_ID)
+    # Sécurité : supprime aussi le dernier message système si Telegram ne l'a pas pris dans la boucle.
+    await delete_last_system_message(context)
 
-    await send_group_and_record(context, "🔴 Groupe fermé, vous ne pouvez plus envoyer.")
+    async with db_pool.acquire() as con:
+        if sid:
+            await con.execute("DELETE FROM messages WHERE chat_id=$1 AND session_id=$2", GROUP_ID, sid)
+        else:
+            await con.execute("DELETE FROM messages WHERE chat_id=$1", GROUP_ID)
+
+    await close_current_session()
+
+    # Le message fermé ne fait PAS partie de la session nettoyée.
+    await send_system_message(context, "🔴 Groupe fermé, vous ne pouvez plus envoyer.", "closed", record_in_session=False)
     return deleted
 
 
 async def save_update_message(update: Update):
     if not update.message:
         return
+    # On enregistre seulement les messages envoyés pendant une session ouverte.
+    if await get_setting("group_open", "off") != "on":
+        return
+    sid = await get_current_session_id()
+    if not sid:
+        return
     await save_message_by_ids(
         update.effective_chat.id,
         update.message.message_id,
         update.effective_user.id if update.effective_user else None,
-        False
+        False,
+        sid
     )
 
 
@@ -567,20 +648,6 @@ async def handle_private_admin(update: Update, context: ContextTypes.DEFAULT_TYP
         await msg.reply_text(f"✅ Mot supprimé : {word}")
         return
 
-    if text.startswith("mot:"):
-        word = text.split(":", 1)[1].strip().lower()
-        async with db_pool.acquire() as con:
-            await con.execute("INSERT INTO banned_words(word) VALUES($1) ON CONFLICT DO NOTHING", word)
-        await msg.reply_text(f"✅ Mot interdit ajouté : {word}")
-        return
-
-    if text.startswith("delmot:"):
-        word = text.split(":", 1)[1].strip().lower()
-        async with db_pool.acquire() as con:
-            await con.execute("DELETE FROM banned_words WHERE word=$1", word)
-        await msg.reply_text(f"✅ Mot supprimé : {word}")
-        return
-
     await msg.reply_text("Admin prêt. Envoie /start pour ouvrir le panel.")
 
 
@@ -662,7 +729,7 @@ async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
             target += timedelta(days=1)
         hours = int((target - now).total_seconds() // 3600)
         try:
-            await send_group_and_record(context, f"⏰ Prochaine ouverture dans {hours} heure(s).")
+            await send_system_message(context, f"⏰ Prochaine ouverture dans {hours} heure(s).", "countdown", record_in_session=False)
         except Exception:
             pass
 
