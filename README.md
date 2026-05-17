@@ -1,4 +1,16 @@
-# Bot Telegram Railway PostgreSQL - version boutons corrigée
+# Bot Telegram Railway PostgreSQL - vraie version corrigée
+
+## Correction de cette version
+
+- Les messages envoyés par le bot dans le groupe sont maintenant enregistrés dans la table messages.
+- Quand le groupe ferme, les anciens messages "Groupe ouvert" et anciens "Groupe fermé" sont supprimés aussi.
+- Le message actuel "Groupe fermé" reste affiché après la fermeture.
+- Le menu Mots interdits a maintenant de vrais boutons :
+  - Ajouter un mot
+  - Supprimer un mot
+  - Voir les mots
+- Une table admin_states est ajoutée pour savoir si l'admin est en mode ajout ou suppression.
+- Toutes les tables PostgreSQL sont créées au démarrage.
 
 ## Variables Railway
 
@@ -10,9 +22,9 @@ TIMEZONE=Europe/Paris
 WEBHOOK_URL=https://TONAPP.up.railway.app
 PORT=8080
 
-## Important
+## Droits du bot dans le groupe
 
-Le bot doit être admin du groupe avec ces droits :
+Le bot doit être admin avec :
 - supprimer messages
 - bannir utilisateurs
 - restreindre utilisateurs
@@ -20,12 +32,17 @@ Le bot doit être admin du groupe avec ces droits :
 
 ## Admin
 
-L'admin envoie /start en privé au bot.
-Si son ID est dans ADMIN_IDS, le panel admin s'affiche.
+En privé avec le bot :
+/start
 
-## Correction incluse
+## Tables
 
-Cette version corrige l'erreur Telegram :
-"Message is not modified"
-
-Les boutons ON/OFF changent maintenant réellement le texte du panel.
+settings
+messages
+media_hashes
+banned_words
+user_violations
+reward_videos
+referrals
+pending_joins
+admin_states

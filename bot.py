@@ -48,6 +48,7 @@ async def init_db():
             chat_id BIGINT NOT NULL,
             message_id BIGINT NOT NULL,
             user_id BIGINT,
+            is_bot BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT NOW(),
             PRIMARY KEY(chat_id, message_id)
         )
@@ -65,7 +66,8 @@ async def init_db():
 
         await con.execute("""
         CREATE TABLE IF NOT EXISTS banned_words(
-            word TEXT PRIMARY KEY
+            word TEXT PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT NOW()
         )
         """)
 
@@ -101,6 +103,14 @@ async def init_db():
             user_id BIGINT PRIMARY KEY,
             referrer_id BIGINT,
             joined_at TIMESTAMP DEFAULT NOW()
+        )
+        """)
+
+        await con.execute("""
+        CREATE TABLE IF NOT EXISTS admin_states(
+            user_id BIGINT PRIMARY KEY,
+            state TEXT,
+            updated_at TIMESTAMP DEFAULT NOW()
         )
         """)
 
@@ -141,6 +151,39 @@ async def count_table(table):
         return await con.fetchval(f"SELECT COUNT(*) FROM {table}")
 
 
+async def save_message_by_ids(chat_id, message_id, user_id=None, is_bot=False):
+    async with db_pool.acquire() as con:
+        await con.execute("""
+        INSERT INTO messages(chat_id,message_id,user_id,is_bot)
+        VALUES($1,$2,$3,$4)
+        ON CONFLICT DO NOTHING
+        """, chat_id, message_id, user_id, is_bot)
+
+
+async def send_group_and_record(context: ContextTypes.DEFAULT_TYPE, text: str, **kwargs):
+    msg = await context.bot.send_message(GROUP_ID, text, **kwargs)
+    await save_message_by_ids(GROUP_ID, msg.message_id, None, True)
+    return msg
+
+
+async def set_admin_state(user_id, state):
+    async with db_pool.acquire() as con:
+        if state is None:
+            await con.execute("DELETE FROM admin_states WHERE user_id=$1", user_id)
+        else:
+            await con.execute("""
+            INSERT INTO admin_states(user_id,state,updated_at)
+            VALUES($1,$2,NOW())
+            ON CONFLICT(user_id) DO UPDATE SET state=$2, updated_at=NOW()
+            """, user_id, state)
+
+
+async def get_admin_state(user_id):
+    async with db_pool.acquire() as con:
+        row = await con.fetchrow("SELECT state FROM admin_states WHERE user_id=$1", user_id)
+        return row["state"] if row else None
+
+
 def is_admin_user(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -155,40 +198,37 @@ async def main_panel_keyboard():
     anti_photo = await get_setting("anti_photo_mention", "off")
     anti_repost = await get_setting("anti_repost", "off")
     auto_schedule = await get_setting("auto_schedule", "off")
-    group_open = await get_setting("group_open", "off")
-
     videos = await count_table("reward_videos")
     video_led = "✅" if videos >= 60 else "❌"
 
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(f"Modération {led(moderation)}", callback_data="toggle:moderation"),
-        ],
-        [
-            InlineKeyboardButton(f"🔗 Anti-liens {led(anti_links)}", callback_data="toggle:anti_links"),
-        ],
-        [
-            InlineKeyboardButton(f"🖼️ Photo mention {led(anti_photo)}", callback_data="toggle:anti_photo_mention"),
-        ],
-        [
-            InlineKeyboardButton(f"♻️ Anti-repost {led(anti_repost)}", callback_data="toggle:anti_repost"),
-        ],
-        [
-            InlineKeyboardButton(f"⏰ Auto horaires {led(auto_schedule)}", callback_data="toggle:auto_schedule"),
-        ],
+        [InlineKeyboardButton(f"🛡️ Modération {led(moderation)}", callback_data="toggle:moderation")],
+        [InlineKeyboardButton(f"🔗 Anti-liens {led(anti_links)}", callback_data="toggle:anti_links")],
+        [InlineKeyboardButton(f"🖼️ Photo mention {led(anti_photo)}", callback_data="toggle:anti_photo_mention")],
+        [InlineKeyboardButton(f"♻️ Anti-repost {led(anti_repost)}", callback_data="toggle:anti_repost")],
+        [InlineKeyboardButton(f"⏰ Auto horaires {led(auto_schedule)}", callback_data="toggle:auto_schedule")],
         [
             InlineKeyboardButton("🟢 Ouvrir maintenant", callback_data="open_group"),
             InlineKeyboardButton("🔴 Fermer + effacer", callback_data="close_group"),
         ],
+        [InlineKeyboardButton("🚫 Mots interdits", callback_data="words_menu")],
+        [InlineKeyboardButton(f"🎁 Vidéos {videos}/60 {video_led}", callback_data="videos_menu")],
+        [InlineKeyboardButton("ℹ️ Infos système", callback_data="info")],
+    ])
+
+
+def back_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="info")]])
+
+
+async def words_keyboard():
+    return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🚫 Mots interdits", callback_data="words"),
+            InlineKeyboardButton("➕ Ajouter un mot", callback_data="word_add"),
+            InlineKeyboardButton("➖ Supprimer un mot", callback_data="word_delete"),
         ],
-        [
-            InlineKeyboardButton(f"🎁 Vidéos {videos}/60 {video_led}", callback_data="videos"),
-        ],
-        [
-            InlineKeyboardButton("ℹ️ Infos système", callback_data="info"),
-        ],
+        [InlineKeyboardButton("📋 Voir les mots", callback_data="word_list")],
+        [InlineKeyboardButton("⬅️ Retour", callback_data="info")],
     ])
 
 
@@ -205,6 +245,7 @@ async def build_status_text(extra=""):
         group_open = await con.fetchval("SELECT value FROM settings WHERE key='group_open'")
 
     video_ok = "✅" if videos >= 60 else "❌"
+
     text = (
         "⚙️ PANEL ADMIN\n\n"
         "🗄️ Base PostgreSQL : ✅ branchée\n"
@@ -241,6 +282,7 @@ async def show_panel(query, extra=""):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_admin_user(update.effective_user.id):
         return
+    await set_admin_state(update.effective_user.id, None)
     await update.message.reply_text(await build_status_text(), reply_markup=await main_panel_keyboard())
 
 
@@ -262,6 +304,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "info":
+        await set_admin_state(q.from_user.id, None)
         await show_panel(q, "infos actualisées")
         return
 
@@ -275,29 +318,53 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_panel(q, f"groupe fermé, {deleted} messages supprimés")
         return
 
-    if data == "videos":
-        videos = await count_table("reward_videos")
+    if data == "words_menu":
+        await set_admin_state(q.from_user.id, None)
         await safe_edit(
             q,
-            f"🎁 VIDÉOS RÉCOMPENSES\n\nStatut : {videos}/60\n\n"
-            "Pour ajouter une vidéo : envoie une vidéo au bot en privé depuis ton compte admin.\n"
-            "Le bot la met automatiquement dans le prochain slot libre.\n\n"
-            "Objectif : 60 vidéos.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Retour", callback_data="info")]])
+            "🚫 MOTS INTERDITS\n\nChoisis une action :",
+            reply_markup=await words_keyboard()
         )
         return
 
-    if data == "words":
-        async with db_pool.acquire() as con:
-            rows = await con.fetch("SELECT word FROM banned_words ORDER BY word")
-        words = "\n".join([f"- {r['word']}" for r in rows]) or "Aucun mot interdit."
+    if data == "word_add":
+        await set_admin_state(q.from_user.id, "adding_word")
         await safe_edit(
             q,
-            "🚫 MOTS INTERDITS\n\n"
-            f"{words}\n\n"
-            "Ajouter : envoie au bot en privé `mot:exemple`\n"
-            "Supprimer : envoie `delmot:exemple`",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Retour", callback_data="info")]])
+            "➕ AJOUTER UN MOT\n\nEnvoie maintenant le mot interdit en message privé au bot.\n\nExemple : arnaque",
+            reply_markup=back_keyboard()
+        )
+        return
+
+    if data == "word_delete":
+        await set_admin_state(q.from_user.id, "deleting_word")
+        await safe_edit(
+            q,
+            "➖ SUPPRIMER UN MOT\n\nEnvoie maintenant le mot à supprimer en message privé au bot.",
+            reply_markup=back_keyboard()
+        )
+        return
+
+    if data == "word_list":
+        async with db_pool.acquire() as con:
+            rows = await con.fetch("SELECT word FROM banned_words ORDER BY word")
+        words = "\n".join([f"• {r['word']}" for r in rows]) or "Aucun mot interdit."
+        await safe_edit(
+            q,
+            f"📋 LISTE DES MOTS INTERDITS\n\n{words}",
+            reply_markup=await words_keyboard()
+        )
+        return
+
+    if data == "videos_menu":
+        videos = await count_table("reward_videos")
+        await safe_edit(
+            q,
+            f"🎁 VIDÉOS RÉCOMPENSES\n\n"
+            f"Statut : {videos}/60 {'✅' if videos >= 60 else '❌'}\n\n"
+            "Pour ajouter une vidéo, envoie une vidéo au bot en privé depuis ton compte admin.\n"
+            "Le bot la met automatiquement dans le prochain slot libre.",
+            reply_markup=back_keyboard()
         )
         return
 
@@ -314,7 +381,7 @@ async def open_group(context: ContextTypes.DEFAULT_TYPE):
         can_send_voice_notes=True,
     )
     await context.bot.set_chat_permissions(GROUP_ID, perms)
-    await context.bot.send_message(GROUP_ID, "🟢 Groupe ouvert, vous pouvez envoyer.")
+    await send_group_and_record(context, "🟢 Groupe ouvert, vous pouvez envoyer.")
 
 
 async def close_group_and_clean(context: ContextTypes.DEFAULT_TYPE):
@@ -322,10 +389,10 @@ async def close_group_and_clean(context: ContextTypes.DEFAULT_TYPE):
     perms = ChatPermissions(can_send_messages=False)
     await context.bot.set_chat_permissions(GROUP_ID, perms)
 
-    deleted = 0
     async with db_pool.acquire() as con:
-        rows = await con.fetch("SELECT chat_id, message_id FROM messages WHERE chat_id=$1", GROUP_ID)
+        rows = await con.fetch("SELECT chat_id, message_id FROM messages WHERE chat_id=$1 ORDER BY created_at ASC", GROUP_ID)
 
+    deleted = 0
     for row in rows:
         try:
             await context.bot.delete_message(row["chat_id"], row["message_id"])
@@ -337,38 +404,42 @@ async def close_group_and_clean(context: ContextTypes.DEFAULT_TYPE):
     async with db_pool.acquire() as con:
         await con.execute("DELETE FROM messages WHERE chat_id=$1", GROUP_ID)
 
-    await context.bot.send_message(GROUP_ID, "🔴 Groupe fermé, vous ne pouvez plus envoyer.")
+    await send_group_and_record(context, "🔴 Groupe fermé, vous ne pouvez plus envoyer.")
     return deleted
 
 
-async def save_message(update: Update):
+async def save_update_message(update: Update):
     if not update.message:
         return
-    async with db_pool.acquire() as con:
-        await con.execute("""
-        INSERT INTO messages(chat_id,message_id,user_id)
-        VALUES($1,$2,$3)
-        ON CONFLICT DO NOTHING
-        """, update.effective_chat.id, update.message.message_id, update.effective_user.id if update.effective_user else None)
+    await save_message_by_ids(
+        update.effective_chat.id,
+        update.message.message_id,
+        update.effective_user.id if update.effective_user else None,
+        False
+    )
 
 
 async def punish_ban(update: Update, context: ContextTypes.DEFAULT_TYPE, reason: str):
     user = update.effective_user
     if not user:
         return
+
     try:
         await context.bot.ban_chat_member(update.effective_chat.id, user.id)
     except Exception:
         pass
+
     try:
         await update.message.delete()
     except Exception:
         pass
-    await context.bot.send_message(
+
+    msg = await context.bot.send_message(
         update.effective_chat.id,
         f"🚫 {user.mention_html()} a été banni pour {reason}. Ne faites pas la même erreur.",
         parse_mode="HTML"
     )
+    await save_message_by_ids(update.effective_chat.id, msg.message_id, None, True)
 
 
 async def punish_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -402,7 +473,12 @@ async def punish_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.ban_chat_member(update.effective_chat.id, user.id)
         action = "ban"
 
-    await context.bot.send_message(update.effective_chat.id, f"🚫 {user.mention_html()} sanctionné : {action}. Respectez les règles.", parse_mode="HTML")
+    msg = await context.bot.send_message(
+        update.effective_chat.id,
+        f"🚫 {user.mention_html()} sanctionné : {action}. Respectez les règles.",
+        parse_mode="HTML"
+    )
+    await save_message_by_ids(update.effective_chat.id, msg.message_id, None, True)
 
 
 def message_file_unique_id(msg):
@@ -422,6 +498,9 @@ async def handle_private_admin(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     msg = update.message
+    user_id = update.effective_user.id
+    state = await get_admin_state(user_id)
+
     if msg.video:
         async with db_pool.acquire() as con:
             slot = await con.fetchval("SELECT COALESCE(MAX(slot),0)+1 FROM reward_videos")
@@ -432,7 +511,28 @@ async def handle_private_admin(update: Update, context: ContextTypes.DEFAULT_TYP
         await msg.reply_text(f"✅ Vidéo ajoutée : {slot}/60")
         return
 
-    text = msg.text or ""
+    text = (msg.text or "").strip()
+
+    if state == "adding_word":
+        word = text.lower()
+        if not word:
+            await msg.reply_text("❌ Envoie un vrai mot.")
+            return
+        async with db_pool.acquire() as con:
+            await con.execute("INSERT INTO banned_words(word) VALUES($1) ON CONFLICT DO NOTHING", word)
+        await set_admin_state(user_id, None)
+        await msg.reply_text(f"✅ Mot interdit ajouté : {word}")
+        return
+
+    if state == "deleting_word":
+        word = text.lower()
+        async with db_pool.acquire() as con:
+            await con.execute("DELETE FROM banned_words WHERE word=$1", word)
+        await set_admin_state(user_id, None)
+        await msg.reply_text(f"✅ Mot supprimé : {word}")
+        return
+
+    # Compatibilité avec l'ancien format
     if text.startswith("mot:"):
         word = text.split(":", 1)[1].strip().lower()
         async with db_pool.acquire() as con:
@@ -447,12 +547,18 @@ async def handle_private_admin(update: Update, context: ContextTypes.DEFAULT_TYP
         await msg.reply_text(f"✅ Mot supprimé : {word}")
         return
 
+    await msg.reply_text(
+        "Admin prêt.\n\n"
+        "Envoie /start pour ouvrir le panel.\n"
+        "Ou envoie une vidéo pour l'ajouter aux récompenses."
+    )
+
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != GROUP_ID or not update.message:
         return
 
-    await save_message(update)
+    await save_update_message(update)
 
     moderation = await get_setting("moderation", "on")
     if moderation != "on":
@@ -475,7 +581,8 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     async with db_pool.acquire() as con:
         words = await con.fetch("SELECT word FROM banned_words")
     for row in words:
-        if row["word"] and row["word"].lower() in text:
+        word = row["word"].lower()
+        if word and re.search(rf"\b{re.escape(word)}\b", text, re.I):
             await punish_word(update, context)
             return
 
@@ -494,7 +601,8 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                         await msg.delete()
                     except Exception:
                         pass
-                    await context.bot.send_message(GROUP_ID, "♻️ C’est du vu et déjà vu.")
+                    warn = await context.bot.send_message(GROUP_ID, "♻️ C’est du vu et déjà vu.")
+                    await save_message_by_ids(GROUP_ID, warn.message_id, None, True)
                     return
 
                 await con.execute("""
@@ -524,7 +632,7 @@ async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
             target += timedelta(days=1)
         hours = int((target - now).total_seconds() // 3600)
         try:
-            await context.bot.send_message(GROUP_ID, f"⏰ Prochaine ouverture dans {hours} heure(s).")
+            await send_group_and_record(context, f"⏰ Prochaine ouverture dans {hours} heure(s).")
         except Exception:
             pass
 
