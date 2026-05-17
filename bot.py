@@ -1,24 +1,18 @@
 
 import os
 import re
-import hashlib
 import asyncio
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import asyncpg
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ChatPermissions,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ChatMemberHandler,
     ContextTypes,
     filters,
 )
@@ -142,57 +136,112 @@ async def set_setting(key, value):
         """, key, value)
 
 
+async def count_table(table):
+    async with db_pool.acquire() as con:
+        return await con.fetchval(f"SELECT COUNT(*) FROM {table}")
+
+
 def is_admin_user(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-def main_panel_keyboard():
+def led(value):
+    return "🟢 ON" if value == "on" else "🔴 OFF"
+
+
+async def main_panel_keyboard():
+    moderation = await get_setting("moderation", "off")
+    anti_links = await get_setting("anti_links", "off")
+    anti_photo = await get_setting("anti_photo_mention", "off")
+    anti_repost = await get_setting("anti_repost", "off")
+    auto_schedule = await get_setting("auto_schedule", "off")
+    group_open = await get_setting("group_open", "off")
+
+    videos = await count_table("reward_videos")
+    video_led = "✅" if videos >= 60 else "❌"
+
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🟢/🔴 Modération", callback_data="toggle:moderation"),
-            InlineKeyboardButton("🔗 Anti-liens", callback_data="toggle:anti_links"),
+            InlineKeyboardButton(f"Modération {led(moderation)}", callback_data="toggle:moderation"),
         ],
         [
-            InlineKeyboardButton("🖼️ Photo mention", callback_data="toggle:anti_photo_mention"),
-            InlineKeyboardButton("♻️ Anti-repost", callback_data="toggle:anti_repost"),
+            InlineKeyboardButton(f"🔗 Anti-liens {led(anti_links)}", callback_data="toggle:anti_links"),
         ],
         [
-            InlineKeyboardButton("⏰ Auto horaires", callback_data="toggle:auto_schedule"),
-            InlineKeyboardButton("🟢 Ouvrir", callback_data="open_group"),
+            InlineKeyboardButton(f"🖼️ Photo mention {led(anti_photo)}", callback_data="toggle:anti_photo_mention"),
         ],
         [
+            InlineKeyboardButton(f"♻️ Anti-repost {led(anti_repost)}", callback_data="toggle:anti_repost"),
+        ],
+        [
+            InlineKeyboardButton(f"⏰ Auto horaires {led(auto_schedule)}", callback_data="toggle:auto_schedule"),
+        ],
+        [
+            InlineKeyboardButton("🟢 Ouvrir maintenant", callback_data="open_group"),
             InlineKeyboardButton("🔴 Fermer + effacer", callback_data="close_group"),
+        ],
+        [
             InlineKeyboardButton("🚫 Mots interdits", callback_data="words"),
         ],
         [
-            InlineKeyboardButton("🎁 Vidéos récompenses", callback_data="videos"),
+            InlineKeyboardButton(f"🎁 Vidéos {videos}/60 {video_led}", callback_data="videos"),
+        ],
+        [
             InlineKeyboardButton("ℹ️ Infos système", callback_data="info"),
         ],
     ])
 
 
-async def build_status_text():
+async def build_status_text(extra=""):
     async with db_pool.acquire() as con:
         videos = await con.fetchval("SELECT COUNT(*) FROM reward_videos")
         msg_count = await con.fetchval("SELECT COUNT(*) FROM messages")
         words = await con.fetchval("SELECT COUNT(*) FROM banned_words")
-    db_ok = "✅"
-    group_ok = "✅" if GROUP_ID else "❌"
+        moderation = await con.fetchval("SELECT value FROM settings WHERE key='moderation'")
+        anti_links = await con.fetchval("SELECT value FROM settings WHERE key='anti_links'")
+        anti_photo = await con.fetchval("SELECT value FROM settings WHERE key='anti_photo_mention'")
+        anti_repost = await con.fetchval("SELECT value FROM settings WHERE key='anti_repost'")
+        auto_schedule = await con.fetchval("SELECT value FROM settings WHERE key='auto_schedule'")
+        group_open = await con.fetchval("SELECT value FROM settings WHERE key='group_open'")
+
     video_ok = "✅" if videos >= 60 else "❌"
-    return (
+    text = (
         "⚙️ PANEL ADMIN\n\n"
-        f"🗄️ Base PostgreSQL : {db_ok} branchée\n"
-        f"👥 Groupe : {group_ok} branché\n"
+        "🗄️ Base PostgreSQL : ✅ branchée\n"
+        f"👥 Groupe : {'✅' if GROUP_ID else '❌'} branché\n"
+        f"🚪 Groupe ouvert : {led(group_open)}\n\n"
+        f"🛡️ Modération : {led(moderation)}\n"
+        f"🔗 Anti-liens : {led(anti_links)}\n"
+        f"🖼️ Photo mention : {led(anti_photo)}\n"
+        f"♻️ Anti-repost : {led(anti_repost)}\n"
+        f"⏰ Auto horaires : {led(auto_schedule)}\n\n"
         f"🎁 Vidéos : {videos}/60 {video_ok}\n"
         f"💬 Messages stockés : {msg_count}\n"
         f"🚫 Mots interdits : {words}\n"
     )
+    if extra:
+        text += f"\n✅ Dernière action : {extra}\n"
+    return text
+
+
+async def safe_edit(query, text, reply_markup=None):
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup)
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            await query.answer("Déjà à jour ✅", show_alert=False)
+        else:
+            raise
+
+
+async def show_panel(query, extra=""):
+    await safe_edit(query, await build_status_text(extra), reply_markup=await main_panel_keyboard())
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_admin_user(update.effective_user.id):
         return
-    await update.message.reply_text(await build_status_text(), reply_markup=main_panel_keyboard())
+    await update.message.reply_text(await build_status_text(), reply_markup=await main_panel_keyboard())
 
 
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -209,43 +258,48 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current = await get_setting(key, "off")
         new = "off" if current == "on" else "on"
         await set_setting(key, new)
-        await q.edit_message_text(await build_status_text(), reply_markup=main_panel_keyboard())
+        await show_panel(q, f"{key} = {new.upper()}")
         return
 
     if data == "info":
-        await q.edit_message_text(await build_status_text(), reply_markup=main_panel_keyboard())
+        await show_panel(q, "infos actualisées")
         return
 
     if data == "open_group":
         await open_group(context)
-        await q.edit_message_text("🟢 Groupe ouvert. Vous pouvez envoyer.", reply_markup=main_panel_keyboard())
+        await show_panel(q, "groupe ouvert")
         return
 
     if data == "close_group":
         deleted = await close_group_and_clean(context)
-        await q.edit_message_text(f"🔴 Groupe fermé. {deleted} messages supprimés.", reply_markup=main_panel_keyboard())
+        await show_panel(q, f"groupe fermé, {deleted} messages supprimés")
         return
 
     if data == "videos":
-        async with db_pool.acquire() as con:
-            videos = await con.fetchval("SELECT COUNT(*) FROM reward_videos")
-        await q.edit_message_text(
+        videos = await count_table("reward_videos")
+        await safe_edit(
+            q,
             f"🎁 VIDÉOS RÉCOMPENSES\n\nStatut : {videos}/60\n\n"
-            "Pour ajouter une vidéo : envoie une vidéo au bot en privé.\n"
-            "Le bot la mettra dans le prochain slot libre.",
+            "Pour ajouter une vidéo : envoie une vidéo au bot en privé depuis ton compte admin.\n"
+            "Le bot la met automatiquement dans le prochain slot libre.\n\n"
+            "Objectif : 60 vidéos.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Retour", callback_data="info")]])
         )
         return
 
     if data == "words":
-        await q.edit_message_text(
+        async with db_pool.acquire() as con:
+            rows = await con.fetch("SELECT word FROM banned_words ORDER BY word")
+        words = "\n".join([f"- {r['word']}" for r in rows]) or "Aucun mot interdit."
+        await safe_edit(
+            q,
             "🚫 MOTS INTERDITS\n\n"
-            "Pour ajouter un mot : envoie au bot en privé :\n"
-            "mot:exemple\n\n"
-            "Pour supprimer :\n"
-            "delmot:exemple",
+            f"{words}\n\n"
+            "Ajouter : envoie au bot en privé `mot:exemple`\n"
+            "Supprimer : envoie `delmot:exemple`",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Retour", callback_data="info")]])
         )
+        return
 
 
 async def open_group(context: ContextTypes.DEFAULT_TYPE):
@@ -310,10 +364,9 @@ async def punish_ban(update: Update, context: ContextTypes.DEFAULT_TYPE, reason:
         await update.message.delete()
     except Exception:
         pass
-    name = user.mention_html()
     await context.bot.send_message(
         update.effective_chat.id,
-        f"🚫 {name} a été banni pour {reason}. Ne faites pas la même erreur.",
+        f"🚫 {user.mention_html()} a été banni pour {reason}. Ne faites pas la même erreur.",
         parse_mode="HTML"
     )
 
@@ -481,14 +534,18 @@ async def post_init(app):
     app.job_queue.run_repeating(hourly_job, interval=60, first=10)
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    print(f"ERROR: {context.error}")
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(callbacks))
-
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE, handle_private_admin))
     app.add_handler(MessageHandler(filters.Chat(GROUP_ID) & ~filters.COMMAND, handle_group_message))
+    app.add_error_handler(error_handler)
 
     app.run_webhook(
         listen="0.0.0.0",
