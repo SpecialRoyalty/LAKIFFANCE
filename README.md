@@ -1,4 +1,4 @@
-# Telegram Railway Bot - FINAL_COMPLETE_V9
+# Telegram Railway Bot - FINAL_COMPLETE_V10
 
 ## Inclus
 
@@ -43,8 +43,16 @@ Le bot doit être admin du groupe avec :
 
 Dans les logs Railway, tu dois voir :
 
-STARTING FINAL_COMPLETE_V9
+STARTING FINAL_COMPLETE_V10
 
 Dans le panel admin, tu dois voir :
 - 📢 Publier publicité
 - 📊 Stats parrainage
+
+
+## V10
+- Horaire Europe/Paris 23h-1h maintenu automatiquement.
+- Ouverture auto même si le bot redémarre pendant la plage.
+- Fermeture auto avec suppression de session.
+- Admins/owner exemptés liens et transferts.
+- Non-admins : liens et transferts interdits.

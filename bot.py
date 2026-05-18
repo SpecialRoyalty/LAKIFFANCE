@@ -18,7 +18,7 @@ from telegram.ext import (
     filters,
 )
 
-APP_VERSION = "FINAL_COMPLETE_V9"
+APP_VERSION = "FINAL_COMPLETE_V10"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").replace("@", "")
@@ -237,6 +237,16 @@ async def save_message(chat_id, message_id, user_id=None, is_bot=False, session_
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
+
+
+async def is_group_admin(context, user_id: int) -> bool:
+    if user_id in ADMIN_IDS:
+        return True
+    try:
+        member = await context.bot.get_chat_member(GROUP_ID, user_id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
 
 
 def led(value):
@@ -544,7 +554,7 @@ async def open_group(context: ContextTypes.DEFAULT_TYPE):
     )
 
     await context.bot.set_chat_permissions(GROUP_ID, perms)
-    await send_system_message(context, "🟢 Groupe ouvert, vous pouvez envoyer.", "open", record_in_session=True)
+    await send_system_message(context, "🟢 Groupe ouvert, vous pouvez envoyer tous vos médias.", "open", record_in_session=True)
     print(f"SESSION OPEN {sid}", flush=True)
 
 
@@ -895,22 +905,32 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await save_user_message_if_session(update)
 
-    if await get_setting("moderation", "on") != "on":
-        return
-
     msg = update.message
     text = (msg.text or msg.caption or "").lower()
 
-    if await get_setting("anti_links", "on") == "on" and URL_RE.search(text):
+    user_id = update.effective_user.id if update.effective_user else 0
+    admin_exempt = await is_group_admin(context, user_id)
+
+    if await get_setting("moderation", "on") != "on":
+        return
+
+    if not admin_exempt and (msg.forward_origin or msg.forward_date):
+        await punish_ban(update, context, "transfert de message")
+        return
+
+    if not admin_exempt and await get_setting("anti_links", "on") == "on" and URL_RE.search(text):
         await punish_ban(update, context, "envoi de lien")
         return
 
-    if await get_setting("anti_photo_mention", "on") == "on":
+    if not admin_exempt and await get_setting("anti_photo_mention", "on") == "on":
         has_photo = bool(msg.photo)
         has_mention = bool(msg.caption_entities and any(e.type in ("mention", "text_mention") for e in msg.caption_entities))
         if has_photo and has_mention:
             await punish_ban(update, context, "photo avec identification")
             return
+
+    if admin_exempt:
+        return
 
     async with db_pool.acquire() as con:
         words = await con.fetch("SELECT word FROM banned_words")
@@ -976,6 +996,12 @@ async def chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ---------------- SCHEDULE ----------------
 
+def is_open_window(now: datetime, open_hour: int, close_hour: int) -> bool:
+    if open_hour < close_hour:
+        return open_hour <= now.hour < close_hour
+    return now.hour >= open_hour or now.hour < close_hour
+
+
 async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
     if await get_setting("auto_schedule", "on") != "on":
         return
@@ -983,21 +1009,29 @@ async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TZ)
     open_hour = int(await get_setting("open_hour", "23"))
     close_hour = int(await get_setting("close_hour", "1"))
+    group_open = await get_setting("group_open", "off")
+    should_be_open = is_open_window(now, open_hour, close_hour)
 
-    if now.minute != 0:
+    if should_be_open and group_open != "on":
+        await open_group(context)
         return
 
-    if now.hour == open_hour:
-        await open_group(context)
-    elif now.hour == close_hour:
+    if not should_be_open and group_open == "on":
         await close_group_and_clean(context)
-    else:
+        return
+
+    if now.minute == 0 and not should_be_open:
         target = now.replace(hour=open_hour, minute=0, second=0, microsecond=0)
         if target <= now:
             target += timedelta(days=1)
         hours = int((target - now).total_seconds() // 3600)
         try:
-            await send_system_message(context, f"⏰ Prochaine ouverture dans {hours} heure(s).", "countdown", record_in_session=False)
+            await send_system_message(
+                context,
+                f"⏰ Prochaine ouverture dans {hours} heure(s).",
+                "countdown",
+                record_in_session=False,
+            )
         except Exception as e:
             print(f"COUNTDOWN ERROR: {e}", flush=True)
 
