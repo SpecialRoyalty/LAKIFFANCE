@@ -1,121 +1,71 @@
-# Telegram Railway Bot - FINAL_COMPLETE_V17
+# Telegram Railway Bot - FINAL_COMPLETE_V20
 
-Version cohérente après remplacement des 60 vidéos par des liens récompenses.
+Version cohérente nettoyée.
 
-## Corrections V13
+## Corrections V18
 
-- Suppression complète de l’ancien système “Vidéo ajoutée 1/60”.
-- Plus aucun upload de vidéos récompenses.
-- Tout passe par `🔗 Liens récompenses`.
-- Les 4 liens requis sont : palier 1, 10, 50 et 60.
-- `📢 Publier publicité` reste bloqué tant que les 4 liens ne sont pas renseignés.
-- `🚫 Ban hash` : le prochain média envoyé en privé sert uniquement à bannir son hash.
-- Média envoyé hors mode `Ban hash` : pas ajouté, message d’explication.
-- Participation : validation uniquement avec photo/vidéo nouvelle.
-- Anti-repost : hash média sur 10 jours.
-- Ban hash : hash interdit reposté = ban direct.
-- Admins/owner exemptés des liens et transferts.
-- Non-admins : liens et transferts interdits.
-- Messages d’entrée/sortie supprimés.
-- Auto ouverture Europe/Paris 23h → 1h.
-- Fermeture avec suppression des messages de session.
-- Règles auto, broadcast, mode RAID, sanctions silencieuses, relance non-participants.
+- Suppression totale de l'affichage `Vidéos : x/60`.
+- Suppression du bouton/ancienne logique `Vidéos 60/60`.
+- Suppression du message `Vidéo ajoutée : x/60`.
+- Le système de récompenses utilise uniquement `🔗 Liens récompenses`.
+- La publicité est bloquée tant que les 4 liens ne sont pas remplis :
+  - palier 1
+  - palier 10
+  - palier 50
+  - palier 60
+- Le panel affiche maintenant :
+  - `🔗 Liens récompenses : ✅ complets` ou `❌ incomplets`
+- Le reste de la V17 est conservé :
+  - horaires dynamiques ;
+  - countdown corrigé ;
+  - trusted moderation ;
+  - bilan trusted fin de session ;
+  - participation ;
+  - ban hash ;
+  - anti-repost ;
+  - règles auto ;
+  - mode RAID ;
+  - sanctions silencieuses.
 
-## Variables Railway
+## Vérification Railway
 
-BOT_TOKEN=TON_NOUVEAU_TOKEN
-BOT_USERNAME=TonBotUsername
-ADMIN_IDS=5296696302
-GROUP_ID=-1003812221754
-DATABASE_URL=${{Postgres.DATABASE_URL}}
-TIMEZONE=Europe/Paris
-WEBHOOK_URL=https://TONAPP.up.railway.app
-PORT=8080
+Dans les logs :
 
-## Vérification
+STARTING FINAL_COMPLETE_V20
 
-Dans les logs Railway :
-
-STARTING FINAL_COMPLETE_V17
-
-Si tu vois encore “Vidéo ajoutée”, Railway tourne encore sur une ancienne version.
+Si tu vois encore `Vidéos : x/60`, c'est que Railway tourne encore sur une ancienne version.
 
 
-## V14
+## V19 - Priorité de modération corrigée
 
-Horaires :
-- semaine : 22h00 → 00h00
-- samedi : 23h00 → 01h00
-- dimanche : 22h30 → 00h15
+Ordre appliqué :
+1. `/ban` et `/supprime` trusted en priorité via CommandHandler.
+2. Commandes `/` normales supprimées ; récidive mute 1 mois.
+3. Admins/owner exemptés.
+4. Liens interdits = ban direct.
+5. Transferts interdits = ban direct.
+6. Photo + mention = ban direct.
+7. Hash interdit = ban direct.
+8. Repost média = suppression.
+9. Mots interdits = sanctions.
+10. Participation obligatoire seulement en dernier.
 
-Countdown corrigé :
-- heures avant dernière heure
-- minutes pendant dernière heure
-- fermeture : 30 min, 15 min puis minute par minute.
-
-
-## V15 - Modération externe trusted
-
-Ajout de :
-
-TRUSTED_IDS=111111111,222222222
-
-Commandes trusted dans le groupe, uniquement en réponse à un message :
-
-/supprime
-- supprime le message ciblé ;
-- ajoute 1 strike à l’auteur ;
-- à 2 strikes dans la même session :
-  - mute 7 jours ;
-  - suppression de tous ses messages de session.
-
-/ban
-- bannit l’auteur ciblé ;
-- supprime tous ses messages de session ;
-- récupère les hash de ses médias déjà postés ;
-- ajoute ces hash dans banned_hashes.
-
-Limites :
-- 20 /supprime maximum par trusted par session ;
-- 20 /ban maximum par trusted par session.
-
-Protection :
-- impossible de cibler owner ;
-- impossible de cibler admin Telegram ;
-- impossible de cibler ADMIN_IDS ;
-- impossible de cibler TRUSTED_IDS.
-
-Vérification logs Railway :
-STARTING FINAL_COMPLETE_V17
+Donc si un non-participant envoie un lien, il est banni pour lien.
 
 
-## V16 - Bilan trusted fin de session
+## V20 - Kick non-participants contrôlé
 
-À chaque fermeture de session, le bot envoie en privé à chaque ADMIN_ID :
+Ajout :
+- bouton `🥾 Kick non-participants ON/OFF`
+- si OFF : seulement dissuasion et identification
+- si ON : kick automatique après 3 jours sans participation
+- limite : 20 kicks / jour
+- nettoyage de l'état participant après kick
+- bilan privé envoyé aux ADMIN_IDS après kick
 
-- session concernée ;
-- nombre de messages supprimés à la fermeture ;
-- nombre de /supprime par trusted ;
-- nombre de /ban par trusted ;
-- alerte si limite 20 atteinte ;
-- liste des utilisateurs ayant reçu des strikes.
-
-Le rapport utilise la table trusted_actions déjà ajoutée en V15.
-
-
-## V17 - Countdown corrigé
-
-Horaires :
-- Lundi à vendredi : 22h00 → 00h00
-- Samedi : 23h00 → 01h00
-- Dimanche : 22h30 → 00h15
-
-Ouverture :
-- avant la dernière heure : affichage en heures à l'heure pile ;
-- dernière heure : affichage en minutes ;
-- 60, 30, 10, puis 5/4/3/2/1 minutes.
-
-Fermeture :
-- 30 min avant ;
-- 15 min avant ;
-- 5/4/3/2/1 min avant.
+Message d'avertissement enrichi :
+- obligation d'envoyer 1 photo ou 1 vidéo jamais déjà postée
+- une seule participation suffit à vie
+- compteur total déjà supprimés
+- état kick automatique ON/OFF
+- limite 20 suppressions/jour

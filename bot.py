@@ -35,7 +35,7 @@ from telegram.ext import (
     filters,
 )
 
-APP_VERSION = "FINAL_COMPLETE_V17"
+APP_VERSION = "FINAL_COMPLETE_V20"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").replace("@", "")
@@ -251,11 +251,15 @@ async def init_db():
             "silent_sanctions": "off",
             "raid_mode": "off",
             "participation": "off",
+            "kick_non_participants": "off",
             "rules_auto": "off",
             "rules_text": "📌 Règles du groupe : respect, pas de lien, pas de repost, participez avec un média nouveau.",
             "rules_message_id": "0",
             "last_countdown_key": "",
             "ban_report_count": "0",
+            "non_participants_kicked_total": "0",
+            "nonparticipant_kicked_today": "0",
+            "last_nonparticipant_kick_date": "",
             "group_open": "off",
             "open_hour": "23",
             "close_hour": "1",
@@ -513,34 +517,41 @@ async def get_admin_state(user_id):
 # ---------------- ADMIN UI ----------------
 
 async def main_keyboard():
-    videos = await count_table("reward_videos")
     moderation = await get_setting("moderation", "off")
     anti_links = await get_setting("anti_links", "off")
     anti_photo = await get_setting("anti_photo_mention", "off")
     anti_repost = await get_setting("anti_repost", "off")
     auto_schedule = await get_setting("auto_schedule", "off")
-    participation = await get_setting("participation", "off")
-    raid = await get_setting("raid_mode", "off")
     silent = await get_setting("silent_sanctions", "off")
+    raid = await get_setting("raid_mode", "off")
+    participation = await get_setting("participation", "off")
+    kick_np = await get_setting("kick_non_participants", "off")
     rules_auto = await get_setting("rules_auto", "off")
+
     links_ok = await reward_links_ready()
+    pub_label = "📢 Publier publicité" if links_ok else "📢 Publicité bloquée : liens manquants"
+
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🛡️ Modération {led(moderation)}", callback_data="toggle:moderation")],
         [InlineKeyboardButton(f"🔗 Anti-liens {led(anti_links)}", callback_data="toggle:anti_links")],
         [InlineKeyboardButton(f"🖼️ Photo mention {led(anti_photo)}", callback_data="toggle:anti_photo_mention")],
         [InlineKeyboardButton(f"♻️ Anti-repost {led(anti_repost)}", callback_data="toggle:anti_repost")],
         [InlineKeyboardButton(f"⏰ Auto horaires {led(auto_schedule)}", callback_data="toggle:auto_schedule")],
-        [InlineKeyboardButton(f"👁️ Sanctions silencieuses {led(silent)}", callback_data="toggle:silent_sanctions")],
+        [InlineKeyboardButton(f"👁️ Sanctions silencieuses {led(silent)}", callback_data="toggle_silent")],
         [InlineKeyboardButton(f"🚨 Mode RAID {led(raid)}", callback_data="toggle_raid")],
         [InlineKeyboardButton(f"🎭 Participation {led(participation)}", callback_data="toggle:participation")],
+        [InlineKeyboardButton(f"🥾 Kick non-participants {led(kick_np)}", callback_data="toggle:kick_non_participants")],
         [InlineKeyboardButton(f"📌 Règles auto {led(rules_auto)}", callback_data="toggle:rules_auto")],
-        [InlineKeyboardButton("🟢 Ouvrir session", callback_data="open_group"), InlineKeyboardButton("🔴 Fermer + effacer", callback_data="close_group")],
+        [
+            InlineKeyboardButton("🟢 Ouvrir session", callback_data="open_group"),
+            InlineKeyboardButton("🔴 Fermer + effacer", callback_data="close_group"),
+        ],
         [InlineKeyboardButton("🚫 Mots interdits", callback_data="words_menu")],
         [InlineKeyboardButton("📌 Modifier règles", callback_data="rules_set")],
         [InlineKeyboardButton("📣 Broadcast groupe", callback_data="broadcast_set")],
         [InlineKeyboardButton("🚫 Ban hash", callback_data="ban_hash_set")],
         [InlineKeyboardButton("🔗 Liens récompenses", callback_data="reward_links_menu")],
-        [InlineKeyboardButton("📢 Publier publicité" if links_ok else "📢 Publicité bloquée : liens manquants", callback_data="publish_ad" if links_ok else "publish_ad_locked")],
+        [InlineKeyboardButton(pub_label, callback_data="publish_ad" if links_ok else "publish_ad_locked")],
         [InlineKeyboardButton("📊 Stats parrainage", callback_data="ref_stats")],
         [InlineKeyboardButton("📣 Relancer non-participants", callback_data="warn_non_participants")],
         [InlineKeyboardButton("ℹ️ Info système", callback_data="info")],
@@ -574,8 +585,9 @@ def back_keyboard():
 
 
 async def panel_text(extra=""):
+    links_ready = await reward_links_ready() if "reward_links_ready" in globals() else False
+
     async with db_pool.acquire() as con:
-        videos = await con.fetchval("SELECT COUNT(*) FROM reward_videos")
         msg_count = await con.fetchval("SELECT COUNT(*) FROM messages")
         words = await con.fetchval("SELECT COUNT(*) FROM banned_words")
         valid_refs = await con.fetchval("SELECT COUNT(*) FROM referrals WHERE validated_at IS NOT NULL")
@@ -586,8 +598,26 @@ async def panel_text(extra=""):
         anti_photo = await con.fetchval("SELECT value FROM settings WHERE key='anti_photo_mention'")
         anti_repost = await con.fetchval("SELECT value FROM settings WHERE key='anti_repost'")
         auto_schedule = await con.fetchval("SELECT value FROM settings WHERE key='auto_schedule'")
+        silent = await con.fetchval("SELECT value FROM settings WHERE key='silent_sanctions'") if await table_has_setting("silent_sanctions") else "off"
+        raid = await con.fetchval("SELECT value FROM settings WHERE key='raid_mode'") if await table_has_setting("raid_mode") else "off"
+        participation = await con.fetchval("SELECT value FROM settings WHERE key='participation'") if await table_has_setting("participation") else "off"
+        kick_np = await con.fetchval("SELECT value FROM settings WHERE key='kick_non_participants'") if await table_has_setting("kick_non_participants") else "off"
+        kicked_total = await con.fetchval("SELECT value FROM settings WHERE key='non_participants_kicked_total'") if await table_has_setting("non_participants_kicked_total") else "0"
+        rules_auto = await con.fetchval("SELECT value FROM settings WHERE key='rules_auto'") if await table_has_setting("rules_auto") else "off"
+
+        non_participants = 0
+        banned_hashes = 0
+        try:
+            non_participants = await con.fetchval("SELECT COUNT(*) FROM participants WHERE has_participated=FALSE")
+        except Exception:
+            pass
+        try:
+            banned_hashes = await con.fetchval("SELECT COUNT(*) FROM banned_hashes")
+        except Exception:
+            pass
 
     sid = await current_session_id()
+
     text = (
         "⚙️ PANEL ADMIN\n\n"
         f"🧩 Version : {APP_VERSION}\n"
@@ -599,16 +629,32 @@ async def panel_text(extra=""):
         f"🔗 Anti-liens : {led(anti_links)}\n"
         f"🖼️ Photo mention : {led(anti_photo)}\n"
         f"♻️ Anti-repost : {led(anti_repost)}\n"
-        f"⏰ Auto horaires : {led(auto_schedule)}\n\n"
-        f"🎁 Vidéos : {videos}/60 {'✅' if videos >= 60 else '❌'}\n"
+        f"⏰ Auto horaires : {led(auto_schedule)}\n"
+        f"👁️ Sanctions silencieuses : {led(silent)}\n"
+        f"🚨 Mode RAID : {led(raid)}\n"
+        f"🎭 Participation : {led(participation)}\n"
+        f"🥾 Kick non-participants : {led(kick_np)}\n"
+        f"🥾 Déjà supprimés non-participation : {kicked_total}\n"
+        f"📌 Règles auto : {led(rules_auto)}\n\n"
+        f"🔗 Liens récompenses : {'✅ complets' if links_ready else '❌ incomplets'}\n"
         f"💬 Messages session stockés : {msg_count}\n"
         f"🚫 Mots interdits : {words}\n"
+        f"🚫 Hash bannis : {banned_hashes}\n"
+        f"🎭 Non-participants : {non_participants}\n"
         f"🔗 Liens privés : {links}\n"
         f"✅ Parrainages validés : {valid_refs}\n"
     )
     if extra:
         text += f"\n✅ Dernière action : {extra}"
     return text
+
+
+async def table_has_setting(key):
+    try:
+        value = await get_setting(key, None)
+        return value is not None
+    except Exception:
+        return False
 
 
 async def safe_edit(query, text, reply_markup=None):
@@ -903,16 +949,6 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rows = await con.fetch("SELECT word FROM banned_words ORDER BY word")
         words = "\n".join([f"• {r['word']}" for r in rows]) or "Aucun mot interdit."
         await safe_edit(q, f"📋 MOTS INTERDITS\n\n{words}", reply_markup=await words_keyboard())
-        return
-
-    if data == "videos_menu":
-        videos = await count_table("reward_videos")
-        await safe_edit(
-            q,
-            f"🎁 VIDÉOS\n\nStatut : {videos}/60 {'✅' if videos >= 60 else '❌'}\n\n"
-            "Pour ajouter une vidéo : envoie une vidéo au bot en privé depuis le compte admin.",
-            reply_markup=back_keyboard(),
-        )
         return
 
 
@@ -1429,6 +1465,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     msg = update.message
     user = update.effective_user
 
+    # 0) Supprime messages Telegram automatiques entrée/sortie.
     if msg.new_chat_members or msg.left_chat_member:
         await delete_message_safe(context, update.effective_chat.id, msg.message_id)
         return
@@ -1436,19 +1473,69 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if not user:
         return
 
+    # 1) Commandes trusted /ban et /supprime sont traitées par CommandHandler avant ce handler.
+    admin_exempt = await is_group_admin(context, user.id)
+
+    # 2) Les autres commandes / sont supprimées. Récidive = mute 1 mois.
+    if msg.text and msg.text.startswith("/") and not admin_exempt:
+        await delete_message_safe(context, GROUP_ID, msg.message_id)
+        async with db_pool.acquire() as con:
+            row = await con.fetchrow("SELECT score FROM danger_scores WHERE user_id=$1", user.id)
+            score = row["score"] if row else 0
+        await add_danger(user.id, 2, "commande slash")
+        if score >= 2:
+            until = datetime.now(TZ) + timedelta(days=30)
+            try:
+                await context.bot.restrict_chat_member(
+                    GROUP_ID,
+                    user.id,
+                    ChatPermissions(can_send_messages=False),
+                    until_date=until
+                )
+            except Exception as e:
+                print(f"SLASH MUTE ERROR: {e}", flush=True)
+        return
+
     await upsert_participant(user)
     await save_user_message_if_session(update)
 
-    admin_exempt = await is_group_admin(context, user.id)
+    if await get_setting("moderation", "on") != "on":
+        return
 
-    if await get_setting("participation", "off") == "on" and not admin_exempt:
-        if not await has_participated(user.id):
-            if not message_is_photo_or_video(msg):
-                await delete_message_safe(context, GROUP_ID, msg.message_id)
-                await send_temp_message(context, GROUP_ID, "Merci de participer avant d’envoyer un message.", seconds=45)
-                await add_danger(user.id, 1, "message avant participation")
-                return
+    # 3) Admins/owner exemptés de toutes les règles fortes.
+    if admin_exempt:
+        return
 
+    text = (msg.text or msg.caption or "").lower()
+
+    # 4) Anti-lien prioritaire : ban direct même si participation ON.
+    if await get_setting("anti_links", "on") == "on" and URL_RE.search(text):
+        await punish_ban(update, context, "envoi de lien")
+        return
+
+    # 5) Transferts interdits prioritaires.
+    is_forward = bool(
+        msg.forward_origin
+        or getattr(msg, "forward_date", None)
+        or getattr(msg, "forward_from", None)
+        or getattr(msg, "forward_from_chat", None)
+    )
+    if is_forward:
+        await punish_ban(update, context, "transfert de message")
+        return
+
+    # 6) Photo + mention prioritaire.
+    if await get_setting("anti_photo_mention", "on") == "on":
+        has_photo = bool(msg.photo)
+        has_mention = bool(
+            msg.caption_entities
+            and any(e.type in ("mention", "text_mention") for e in msg.caption_entities)
+        )
+        if has_photo and has_mention:
+            await punish_ban(update, context, "photo avec identification")
+            return
+
+    # 7) Hash média : ban hash puis anti-repost avant participation.
     h = None
     if message_has_media(msg):
         try:
@@ -1459,74 +1546,73 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if h:
         async with db_pool.acquire() as con:
             banned = await con.fetchrow("SELECT hash FROM banned_hashes WHERE hash=$1", h)
-        if banned and not admin_exempt:
-            await punish_ban(update, context, "hash interdit", "🚫 Je viens de choper automatiquement une publication interdite ici.")
+
+        if banned:
+            await punish_ban(
+                update,
+                context,
+                "hash interdit",
+                "🚫 Je viens de choper automatiquement une publication interdite ici."
+            )
             return
+
         if await get_setting("anti_repost", "on") == "on":
             async with db_pool.acquire() as con:
-                old = await con.fetchrow("SELECT hash FROM media_fingerprints WHERE hash=$1 AND created_at > NOW() - INTERVAL '10 days' LIMIT 1", h)
+                old = await con.fetchrow("""
+                SELECT hash FROM media_hashes
+                WHERE hash=$1 AND created_at > NOW() - INTERVAL '10 days'
+                LIMIT 1
+                """, h)
+
             if old:
                 await delete_message_safe(context, GROUP_ID, msg.message_id)
-                if not await has_participated(user.id) and await get_setting("participation", "off") == "on":
-                    warn = await context.bot.send_message(GROUP_ID, "♻️ Ce média a déjà été envoyé. Merci de participer avec un contenu nouveau.")
+                if await get_setting("participation", "off") == "on" and not await has_participated(user.id):
+                    warn = await context.bot.send_message(
+                        GROUP_ID,
+                        "♻️ Ce média a déjà été envoyé. Merci de participer avec un contenu nouveau."
+                    )
                 else:
                     warn = await context.bot.send_message(GROUP_ID, "♻️ C’est du vu et déjà vu.")
                 await save_message(GROUP_ID, warn.message_id, None, True)
                 await add_danger(user.id, 2, "repost média")
                 return
+
         async with db_pool.acquire() as con:
             await con.execute("""
-            INSERT INTO media_fingerprints(hash,chat_id,user_id,message_id,media_type,used_for_participation)
+            INSERT INTO media_hashes(hash,chat_id,user_id,message_id,media_type,used_for_participation)
             VALUES($1,$2,$3,$4,$5,$6)
             ON CONFLICT(hash) DO NOTHING
             """, h, GROUP_ID, user.id, msg.message_id, media_type(msg), bool(message_is_photo_or_video(msg)))
-        if await get_setting("participation", "off") == "on" and message_is_photo_or_video(msg) and not await has_participated(user.id):
-            await mark_participated(user.id, h)
 
-    if await get_setting("moderation", "on") != "on":
-        return
-
-    if admin_exempt:
-        return
-
-    text = (msg.text or msg.caption or "").lower()
-
-    if msg.text and msg.text.startswith("/"):
-        await delete_message_safe(context, GROUP_ID, msg.message_id)
-        await add_danger(user.id, 2, "commande slash")
-        async with db_pool.acquire() as con:
-            row = await con.fetchrow("SELECT score FROM danger_scores WHERE user_id=$1", user.id)
-        if row and row['score'] >= 4:
-            until = datetime.now(TZ) + timedelta(days=30)
-            await context.bot.restrict_chat_member(GROUP_ID, user.id, ChatPermissions(can_send_messages=False), until_date=until)
-        return
-
-    is_forward = bool(msg.forward_origin or getattr(msg, "forward_date", None) or getattr(msg, "forward_from", None) or getattr(msg, "forward_from_chat", None))
-    if is_forward:
-        await punish_ban(update, context, "transfert de message")
-        return
-
-    if await get_setting("anti_links", "on") == "on" and URL_RE.search(text):
-        await punish_ban(update, context, "envoi de lien")
-        return
-
-    if await get_setting("anti_photo_mention", "on") == "on":
-        has_photo = bool(msg.photo)
-        has_mention = bool(msg.caption_entities and any(e.type in ("mention", "text_mention") for e in msg.caption_entities))
-        if has_photo and has_mention:
-            await punish_ban(update, context, "photo avec identification")
-            return
-
+    # 8) Mots interdits.
     async with db_pool.acquire() as con:
         words = await con.fetch("SELECT word FROM banned_words")
     for r in words:
         word = r["word"].lower()
-        if word and re.search(rf"{re.escape(word)}", text, re.I):
+        if word and re.search(rf"\b{re.escape(word)}\b", text, re.I):
             await punish_word(update, context)
             return
 
+    # 9) Participation obligatoire EN DERNIER.
+    if await get_setting("participation", "off") == "on":
+        if not await has_participated(user.id):
+            if not message_is_photo_or_video(msg):
+                await delete_message_safe(context, GROUP_ID, msg.message_id)
+                await send_temp_message(
+                    context,
+                    GROUP_ID,
+                    "Merci de participer avant d’envoyer un message.",
+                    seconds=45
+                )
+                await add_danger(user.id, 1, "message avant participation")
+                return
 
-# ---------------- JOIN TRACKING ----------------
+            if h:
+                await mark_participated(user.id, h)
+                return
+
+    return
+
 
 async def chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cmu = update.chat_member
@@ -1578,45 +1664,123 @@ async def chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def warn_non_participants(context):
     if await get_setting("participation", "off") != "on":
         return 0
+
+    kicked_total = await get_setting("non_participants_kicked_total", "0")
+    kick_np = await get_setting("kick_non_participants", "off")
+
     async with db_pool.acquire() as con:
         rows = await con.fetch("""
-        SELECT user_id, username, first_name FROM participants
+        SELECT user_id, username, first_name
+        FROM participants
         WHERE has_participated=FALSE
         ORDER BY joined_at ASC
         LIMIT 200
         """)
+
+    if not rows:
+        return 0
+
     total = 0
     for i in range(0, len(rows), 20):
         batch = rows[i:i+20]
         mentions = []
         for r in batch:
-            mentions.append(f"@{r['username']}" if r['username'] else f'<a href="tg://user?id={r["user_id"]}">{r["first_name"] or r["user_id"]}</a>')
-        txt = "⚠️ Veuillez participer si vous voulez rester dans le groupe, sinon vous serez supprimé sous peu.\n\n" + " ".join(mentions)
+            if r["username"]:
+                mentions.append(f"@{r['username']}")
+            else:
+                mentions.append(f'<a href="tg://user?id={r["user_id"]}">{r["first_name"] or r["user_id"]}</a>')
+
+        txt = (
+            "⚠️ Veuillez participer si vous voulez rester dans le groupe.\n"
+            "Envoyez au moins 1 photo ou 1 vidéo jamais déjà postée.\n\n"
+            "✅ Une seule participation valide suffit pour rester définitivement.\n\n"
+            "Si vous ne participez pas, vous serez supprimé du groupe sous peu.\n\n"
+            f"🥾 Déjà supprimés pour non-participation : {kicked_total}\n"
+            f"🥾 Kick automatique : {'ON' if kick_np == 'on' else 'OFF'}\n"
+            "Limite : 20 suppressions / jour\n\n"
+        )
+        txt += " ".join(mentions)
+
         msg = await context.bot.send_message(GROUP_ID, txt, parse_mode="HTML")
         await save_message(GROUP_ID, msg.message_id, None, True)
         total += len(batch)
+        await asyncio.sleep(0.2)
+
         async with db_pool.acquire() as con:
             for r in batch:
-                await con.execute("UPDATE participants SET warn_count=warn_count+1, last_warned_at=NOW() WHERE user_id=$1", r['user_id'])
-        await asyncio.sleep(0.2)
+                await con.execute("""
+                UPDATE participants
+                SET warn_count=warn_count+1, last_warned_at=NOW()
+                WHERE user_id=$1
+                """, r["user_id"])
+
     return total
+
 
 async def kick_old_non_participants(context):
     if await get_setting("participation", "off") != "on":
         return
+    if await get_setting("kick_non_participants", "off") != "on":
+        return
+
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    last_day = await get_setting("last_nonparticipant_kick_date", "")
+
+    if last_day != today:
+        await set_setting("last_nonparticipant_kick_date", today)
+        await set_setting("nonparticipant_kicked_today", "0")
+
+    kicked_today = int(await get_setting("nonparticipant_kicked_today", "0") or "0")
+    remaining = max(0, 20 - kicked_today)
+    if remaining <= 0:
+        return
+
     async with db_pool.acquire() as con:
         rows = await con.fetch("""
-        SELECT user_id FROM participants
-        WHERE has_participated=FALSE AND joined_at < NOW() - INTERVAL '3 days'
-        LIMIT 100
-        """)
+        SELECT user_id
+        FROM participants
+        WHERE has_participated=FALSE
+          AND joined_at < NOW() - INTERVAL '3 days'
+        ORDER BY joined_at ASC
+        LIMIT $1
+        """, remaining)
+
+    if not rows:
+        return
+
+    kicked = 0
     for r in rows:
+        uid = r["user_id"]
         try:
-            await context.bot.ban_chat_member(GROUP_ID, r['user_id'])
-            await context.bot.unban_chat_member(GROUP_ID, r['user_id'], only_if_banned=True)
+            await context.bot.ban_chat_member(GROUP_ID, uid)
+            await context.bot.unban_chat_member(GROUP_ID, uid, only_if_banned=True)
+            kicked += 1
         except Exception as e:
-            print(f"KICK NON PARTICIPANT ERROR {r['user_id']}: {e}", flush=True)
+            print(f"KICK NON PARTICIPANT ERROR {uid}: {e}", flush=True)
+
+        async with db_pool.acquire() as con:
+            await con.execute("DELETE FROM participants WHERE user_id=$1", uid)
+            await con.execute("DELETE FROM pending_joins WHERE invited_user_id=$1", uid)
+
         await asyncio.sleep(0.1)
+
+    if kicked:
+        old_total = int(await get_setting("non_participants_kicked_total", "0") or "0")
+        await set_setting("non_participants_kicked_total", old_total + kicked)
+        await set_setting("nonparticipant_kicked_today", kicked_today + kicked)
+
+        report = (
+            "🥾 Bilan kick non-participants\n\n"
+            f"Supprimés aujourd'hui : {kicked_today + kicked}/20\n"
+            f"Nouveaux supprimés maintenant : {kicked}\n"
+            f"Total supprimés pour non-participation : {old_total + kicked}"
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(admin_id, report)
+            except Exception as e:
+                print(f"KICK REPORT SEND ERROR admin={admin_id}: {e}", flush=True)
+
 
 async def post_rules(context):
     if await get_setting("rules_auto", "off") != "on":
