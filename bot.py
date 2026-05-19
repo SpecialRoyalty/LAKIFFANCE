@@ -19,7 +19,7 @@ from telegram.ext import (
     filters,
 )
 
-APP_VERSION = "FINAL_COMPLETE_V12"
+APP_VERSION = "FINAL_COMPLETE_V13"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").replace("@", "")
@@ -104,13 +104,6 @@ async def init_db():
             file_unique_id TEXT NOT NULL,
             message_id BIGINT,
             created_at TIMESTAMP DEFAULT NOW()
-        )
-        """)
-        await con.execute("""
-        CREATE TABLE IF NOT EXISTS reward_videos(
-            slot INTEGER PRIMARY KEY,
-            file_id TEXT NOT NULL,
-            uploaded_at TIMESTAMP DEFAULT NOW()
         )
         """)
         await con.execute("""
@@ -222,7 +215,6 @@ async def init_db():
             "rules_auto": "off",
             "rules_text": "📌 Règles du groupe : respect, pas de lien, pas de repost, participez avec un média nouveau.",
             "rules_message_id": "0",
-            "last_countdown_key": "",
             "ban_report_count": "0",
             "group_open": "off",
             "open_hour": "23",
@@ -967,18 +959,6 @@ async def handle_private_admin(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     state = await get_admin_state(user.id)
-
-    if msg.video:
-        async with db_pool.acquire() as con:
-            slot = await con.fetchval("SELECT COALESCE(MAX(slot),0)+1 FROM reward_videos")
-            if slot > 60:
-                await msg.reply_text("✅ Les 60 vidéos sont déjà uploadées.")
-                return
-            await con.execute("INSERT INTO reward_videos(slot,file_id) VALUES($1,$2)", slot, msg.video.file_id)
-
-        await msg.reply_text(f"✅ Vidéo ajoutée : {slot}/60")
-        return
-
     text = (msg.text or "").strip()
 
     if state == "adding_word":
@@ -1040,6 +1020,10 @@ async def handle_private_admin(update: Update, context: ContextTypes.DEFAULT_TYP
         await set_admin_state(user.id, None)
         await msg.reply_text("✅ Hash banni. Toute republication sera bannie automatiquement.")
         return
+    if message_has_media(msg):
+        await msg.reply_text("ℹ️ Média reçu, mais aucun mode actif. Pour bannir un hash, clique d’abord sur 🚫 Ban hash dans le panel.")
+        return
+
     await msg.reply_text("Admin prêt. Envoie /start pour ouvrir le panel.")
 
 
@@ -1360,52 +1344,6 @@ def is_open_window(now: datetime, open_hour: int, close_hour: int) -> bool:
     return now.hour >= open_hour or now.hour < close_hour
 
 
-def minutes_until_target(now: datetime, target_hour: int) -> int:
-    target = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    seconds = int((target - now).total_seconds())
-    return max(0, (seconds + 59) // 60)
-
-
-def countdown_open_key(minutes_left: int):
-    # Ouverture : 1h, 30 min, 10 min, puis 5,4,3,2,1 et imminent.
-    if minutes_left > 60:
-        return None
-    if minutes_left == 60:
-        return "open_60"
-    if minutes_left == 30:
-        return "open_30"
-    if minutes_left == 10:
-        return "open_10"
-    if 1 <= minutes_left <= 5:
-        return f"open_{minutes_left}"
-    if minutes_left == 0:
-        return "open_now"
-    return None
-
-
-def countdown_close_key(minutes_left: int):
-    # Fermeture : 30 min, 15 min, puis 5,4,3,2,1.
-    if minutes_left == 30:
-        return "close_30"
-    if minutes_left == 15:
-        return "close_15"
-    if 1 <= minutes_left <= 5:
-        return f"close_{minutes_left}"
-    if minutes_left == 0:
-        return "close_now"
-    return None
-
-
-async def send_countdown_once(context: ContextTypes.DEFAULT_TYPE, key: str, text: str):
-    last = await get_setting("last_countdown_key", "")
-    if last == key:
-        return
-    await set_setting("last_countdown_key", key)
-    await send_system_message(context, text, "countdown", record_in_session=False)
-
-
 async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
     if await get_setting("auto_schedule", "on") != "on":
         return
@@ -1416,62 +1354,29 @@ async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
     group_open = await get_setting("group_open", "off")
     should_be_open = is_open_window(now, open_hour, close_hour)
 
-    # Ouverture automatique.
     if should_be_open and group_open != "on":
-        await set_setting("last_countdown_key", "")
         await open_group(context)
         await warn_non_participants(context)
         return
 
-    # Fermeture automatique.
     if not should_be_open and group_open == "on":
-        await set_setting("last_countdown_key", "")
         await close_group_and_clean(context)
         return
 
-    # Groupe fermé : compte à rebours vers ouverture.
-    if group_open != "on":
-        minutes_left = minutes_until_target(now, open_hour)
-
-        # Plus de 60 minutes : message seulement à chaque heure pile.
-        if minutes_left > 60:
-            if now.minute == 0:
-                hours = max(1, minutes_left // 60)
-                await send_countdown_once(
-                    context,
-                    f"open_hour_{hours}",
-                    f"⏰ Prochaine ouverture dans {hours} heure(s)."
-                )
-            return
-
-        key = countdown_open_key(minutes_left)
-        if not key:
-            return
-
-        if minutes_left == 0:
-            await send_countdown_once(context, key, "⏰ Ouverture imminente...")
-        elif minutes_left == 60:
-            await send_countdown_once(context, key, "⏰ Prochaine ouverture dans 1 heure.")
-        elif minutes_left == 30:
-            await send_countdown_once(context, key, "⏰ Prochaine ouverture dans 30 minutes.")
-        elif minutes_left == 10:
-            await send_countdown_once(context, key, "⏰ Ouverture dans 10 minutes.")
-        elif 1 <= minutes_left <= 5:
-            await send_countdown_once(context, key, f"⏰ Ouverture dans {minutes_left} minute(s).")
-        return
-
-    # Groupe ouvert : compte à rebours vers fermeture.
-    minutes_left = minutes_until_target(now, close_hour)
-    key = countdown_close_key(minutes_left)
-    if not key:
-        return
-
-    if minutes_left == 30:
-        await send_countdown_once(context, key, "⚠️ Fermeture du groupe dans 30 minutes.")
-    elif minutes_left == 15:
-        await send_countdown_once(context, key, "⚠️ Fermeture du groupe dans 15 minutes.")
-    elif 1 <= minutes_left <= 5:
-        await send_countdown_once(context, key, f"⚠️ Fermeture dans {minutes_left} minute(s).")
+    if now.minute == 0 and not should_be_open:
+        target = now.replace(hour=open_hour, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        hours = int((target - now).total_seconds() // 3600)
+        try:
+            await send_system_message(
+                context,
+                f"⏰ Prochaine ouverture dans {hours} heure(s).",
+                "countdown",
+                record_in_session=False,
+            )
+        except Exception as e:
+            print(f"COUNTDOWN ERROR: {e}", flush=True)
 
 
 async def post_init(app):

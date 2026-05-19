@@ -1,26 +1,25 @@
-# Telegram Railway Bot - FINAL_COMPLETE_V12
+# Telegram Railway Bot - FINAL_COMPLETE_V13
 
-## Nouveautés V11
+Version cohérente après remplacement des 60 vidéos par des liens récompenses.
 
-- Participation ON/OFF : avant d'écrire, un membre doit envoyer une photo ou vidéo nouvelle.
-- Participation validée à vie après 1 média nouveau.
-- Si média déjà vu : pas de validation, suppression et message d'avertissement.
-- Relance non-participants par lots de 20 à l'ouverture.
-- Kick des non-participants après 3 jours sans participation.
-- Hash média SHA256 téléchargé depuis Telegram, plus solide que file_unique_id.
-- Anti-repost étendu à 10 jours via hash.
-- Ban hash : l'admin envoie une photo/vidéo au bot, son hash est banni.
-- Si hash banni republié : ban direct + message automatique.
-- Règles auto toutes les 15 minutes quand le groupe est ouvert, l'ancien message règles est supprimé.
-- Bilan de sanctions toutes les 20 minutes quand le groupe est ouvert.
-- Silent mode : sanctions visibles ON/OFF.
-- Mode RAID ON/OFF : nouveaux membres mute et médias bloqués.
-- Broadcast groupe depuis le panel admin.
-- Les commandes / dans le groupe sont supprimées ; récidive = mute 1 mois.
-- Ajout de bot interdit.
-- Admins Telegram / owner / ADMIN_IDS exemptés des liens et transferts.
-- Non-admins : liens et transferts = ban.
-- Récompenses remplacées par 4 liens hébergeur : 1, 10, 50, 60.
+## Corrections V13
+
+- Suppression complète de l’ancien système “Vidéo ajoutée 1/60”.
+- Plus aucun upload de vidéos récompenses.
+- Tout passe par `🔗 Liens récompenses`.
+- Les 4 liens requis sont : palier 1, 10, 50 et 60.
+- `📢 Publier publicité` reste bloqué tant que les 4 liens ne sont pas renseignés.
+- `🚫 Ban hash` : le prochain média envoyé en privé sert uniquement à bannir son hash.
+- Média envoyé hors mode `Ban hash` : pas ajouté, message d’explication.
+- Participation : validation uniquement avec photo/vidéo nouvelle.
+- Anti-repost : hash média sur 10 jours.
+- Ban hash : hash interdit reposté = ban direct.
+- Admins/owner exemptés des liens et transferts.
+- Non-admins : liens et transferts interdits.
+- Messages d’entrée/sortie supprimés.
+- Auto ouverture Europe/Paris 23h → 1h.
+- Fermeture avec suppression des messages de session.
+- Règles auto, broadcast, mode RAID, sanctions silencieuses, relance non-participants.
 
 ## Variables Railway
 
@@ -37,38 +36,6 @@ PORT=8080
 
 Dans les logs Railway :
 
-STARTING FINAL_COMPLETE_V12
+STARTING FINAL_COMPLETE_V13
 
-## Droits Telegram requis
-
-Le bot doit être admin avec :
-- supprimer messages
-- bannir utilisateurs
-- restreindre utilisateurs
-- gérer permissions
-- inviter via lien
-
-## Base ancienne
-
-Si tu as des erreurs de colonnes à cause d'une ancienne base, supprime seulement les tables concernées :
-
-pending_joins, referrals, referral_links, user_rewards, referrer_abuse, reward_links, participants, banned_hashes, media_fingerprints, danger_scores
-
-Ne supprime pas settings si tu veux garder les réglages.
-
-
-## V12 - Correction compte à rebours
-
-Ouverture :
-- > 1h : message par heure.
-- 1h avant : Prochaine ouverture dans 1 heure.
-- 30 min avant : Prochaine ouverture dans 30 minutes.
-- 10 min avant : Ouverture dans 10 minutes.
-- 5,4,3,2,1 min avant : compte à rebours minute par minute.
-- puis ouverture automatique.
-
-Fermeture :
-- 30 min avant : avertissement.
-- 15 min avant : avertissement.
-- 5,4,3,2,1 min avant : compte à rebours minute par minute.
-- puis fermeture + suppression de session.
+Si tu vois encore “Vidéo ajoutée”, Railway tourne encore sur une ancienne version.
