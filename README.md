@@ -1,4 +1,4 @@
-# Telegram Railway Bot - FINAL_COMPLETE_V13
+# Telegram Railway Bot - FINAL_COMPLETE_V15
 
 Version cohérente après remplacement des 60 vidéos par des liens récompenses.
 
@@ -36,7 +36,7 @@ PORT=8080
 
 Dans les logs Railway :
 
-STARTING FINAL_COMPLETE_V13
+STARTING FINAL_COMPLETE_V15
 
 Si tu vois encore “Vidéo ajoutée”, Railway tourne encore sur une ancienne version.
 
@@ -52,3 +52,38 @@ Countdown corrigé :
 - heures avant dernière heure
 - minutes pendant dernière heure
 - fermeture : 30 min, 15 min puis minute par minute.
+
+
+## V15 - Modération externe trusted
+
+Ajout de :
+
+TRUSTED_IDS=111111111,222222222
+
+Commandes trusted dans le groupe, uniquement en réponse à un message :
+
+/supprime
+- supprime le message ciblé ;
+- ajoute 1 strike à l’auteur ;
+- à 2 strikes dans la même session :
+  - mute 7 jours ;
+  - suppression de tous ses messages de session.
+
+/ban
+- bannit l’auteur ciblé ;
+- supprime tous ses messages de session ;
+- récupère les hash de ses médias déjà postés ;
+- ajoute ces hash dans banned_hashes.
+
+Limites :
+- 20 /supprime maximum par trusted par session ;
+- 20 /ban maximum par trusted par session.
+
+Protection :
+- impossible de cibler owner ;
+- impossible de cibler admin Telegram ;
+- impossible de cibler ADMIN_IDS ;
+- impossible de cibler TRUSTED_IDS.
+
+Vérification logs Railway :
+STARTING FINAL_COMPLETE_V15

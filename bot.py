@@ -35,11 +35,12 @@ from telegram.ext import (
     filters,
 )
 
-APP_VERSION = "FINAL_COMPLETE_V14"
+APP_VERSION = "FINAL_COMPLETE_V15"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").replace("@", "")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+TRUSTED_IDS = [int(x.strip()) for x in os.getenv("TRUSTED_IDS", "").split(",") if x.strip()]
 GROUP_ID = int(os.getenv("GROUP_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
@@ -160,6 +161,28 @@ async def init_db():
             user_id BIGINT PRIMARY KEY,
             state TEXT,
             updated_at TIMESTAMP DEFAULT NOW()
+        )
+        """)
+
+        await con.execute("""
+        CREATE TABLE IF NOT EXISTS trusted_actions(
+            id SERIAL PRIMARY KEY,
+            session_id INTEGER,
+            trusted_id BIGINT NOT NULL,
+            action TEXT NOT NULL,
+            target_user_id BIGINT,
+            target_message_id BIGINT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+        """)
+
+        await con.execute("""
+        CREATE TABLE IF NOT EXISTS trusted_strikes(
+            session_id INTEGER NOT NULL,
+            target_user_id BIGINT NOT NULL,
+            strikes INTEGER DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY(session_id, target_user_id)
         )
         """)
 
@@ -313,6 +336,10 @@ async def save_message(chat_id, message_id, user_id=None, is_bot=False, session_
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
+
+
+def is_trusted_id(user_id):
+    return user_id in ADMIN_IDS or user_id in TRUSTED_IDS
 
 
 async def is_group_admin(context, user_id: int) -> bool:
@@ -598,6 +625,204 @@ async def show_panel(query, extra=""):
 
 
 # ---------------- START / CALLBACKS ----------------
+
+
+
+# =========================
+# TRUSTED MODERATION
+# =========================
+
+async def get_session_for_trusted():
+    sid = await current_session_id()
+    return sid if sid else 0
+
+
+async def trusted_action_count(session_id: int, trusted_id: int, action: str) -> int:
+    async with db_pool.acquire() as con:
+        return await con.fetchval(
+            "SELECT COUNT(*) FROM trusted_actions WHERE session_id=$1 AND trusted_id=$2 AND action=$3",
+            session_id, trusted_id, action
+        )
+
+
+async def log_trusted_action(session_id: int, trusted_id: int, action: str, target_user_id: int, target_message_id: int):
+    async with db_pool.acquire() as con:
+        await con.execute("""
+        INSERT INTO trusted_actions(session_id,trusted_id,action,target_user_id,target_message_id)
+        VALUES($1,$2,$3,$4,$5)
+        """, session_id, trusted_id, action, target_user_id, target_message_id)
+
+
+async def delete_user_session_messages(context: ContextTypes.DEFAULT_TYPE, target_user_id: int):
+    sid = await current_session_id()
+    if not sid:
+        return 0
+
+    async with db_pool.acquire() as con:
+        rows = await con.fetch("""
+        SELECT chat_id, message_id
+        FROM messages
+        WHERE chat_id=$1 AND session_id=$2 AND user_id=$3
+        ORDER BY created_at ASC
+        """, GROUP_ID, sid, target_user_id)
+
+    deleted = 0
+    for r in rows:
+        if await delete_message_safe(context, r["chat_id"], r["message_id"]):
+            deleted += 1
+        await asyncio.sleep(0.03)
+    return deleted
+
+
+async def ban_hashes_from_user_session(target_user_id: int):
+    sid = await current_session_id()
+    async with db_pool.acquire() as con:
+        if sid:
+            rows = await con.fetch("""
+            SELECT hash, media_type
+            FROM media_hashes
+            WHERE user_id=$1
+              AND hash IS NOT NULL
+              AND created_at > NOW() - INTERVAL '10 days'
+            """, target_user_id)
+        else:
+            rows = await con.fetch("""
+            SELECT hash, media_type
+            FROM media_hashes
+            WHERE user_id=$1
+              AND hash IS NOT NULL
+              AND created_at > NOW() - INTERVAL '10 days'
+            """, target_user_id)
+
+        for r in rows:
+            await con.execute("""
+            INSERT INTO banned_hashes(hash,media_type,reason)
+            VALUES($1,$2,$3)
+            ON CONFLICT(hash) DO UPDATE SET reason=$3
+            """, r["hash"], r["media_type"], "trusted ban user media")
+
+    return len(rows)
+
+
+async def trusted_supprime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    actor = update.effective_user
+    if not msg or not actor:
+        return
+
+    if not is_trusted_id(actor.id):
+        await delete_message_safe(context, msg.chat_id, msg.message_id)
+        return
+
+    if not msg.reply_to_message or not msg.reply_to_message.from_user:
+        await delete_message_safe(context, msg.chat_id, msg.message_id)
+        return
+
+    target = msg.reply_to_message.from_user
+
+    if await is_group_admin(context, target.id) or target.id in TRUSTED_IDS:
+        await delete_message_safe(context, msg.chat_id, msg.message_id)
+        if not await is_silent():
+            warn = await context.bot.send_message(GROUP_ID, "⛔ Action refusée : impossible de cibler un admin, owner ou trusted.")
+            await save_message(GROUP_ID, warn.message_id, None, True)
+        return
+
+    sid = await get_session_for_trusted()
+    used = await trusted_action_count(sid, actor.id, "supprime")
+    if used >= 20:
+        await delete_message_safe(context, msg.chat_id, msg.message_id)
+        if not await is_silent():
+            warn = await context.bot.send_message(GROUP_ID, "⛔ Limite atteinte : 20 /supprime par session.")
+            await save_message(GROUP_ID, warn.message_id, None, True)
+        return
+
+    await delete_message_safe(context, msg.chat_id, msg.reply_to_message.message_id)
+    await delete_message_safe(context, msg.chat_id, msg.message_id)
+    await log_trusted_action(sid, actor.id, "supprime", target.id, msg.reply_to_message.message_id)
+
+    async with db_pool.acquire() as con:
+        row = await con.fetchrow(
+            "SELECT strikes FROM trusted_strikes WHERE session_id=$1 AND target_user_id=$2",
+            sid, target.id
+        )
+        strikes = (row["strikes"] if row else 0) + 1
+        await con.execute("""
+        INSERT INTO trusted_strikes(session_id,target_user_id,strikes,updated_at)
+        VALUES($1,$2,$3,NOW())
+        ON CONFLICT(session_id,target_user_id)
+        DO UPDATE SET strikes=$3, updated_at=NOW()
+        """, sid, target.id, strikes)
+
+    if strikes >= 2:
+        until = datetime.now(TZ) + timedelta(days=7)
+        try:
+            await context.bot.restrict_chat_member(GROUP_ID, target.id, ChatPermissions(can_send_messages=False), until_date=until)
+        except Exception as e:
+            print(f"TRUSTED MUTE ERROR: {e}", flush=True)
+
+        deleted = await delete_user_session_messages(context, target.id)
+        await add_danger(target.id, 5, "trusted strikes")
+        if not await is_silent():
+            note = await context.bot.send_message(
+                GROUP_ID,
+                f"🔇 Utilisateur sanctionné : mute 7 jours. {deleted} message(s) supprimé(s)."
+            )
+            await save_message(GROUP_ID, note.message_id, None, True)
+
+
+async def trusted_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    actor = update.effective_user
+    if not msg or not actor:
+        return
+
+    if not is_trusted_id(actor.id):
+        await delete_message_safe(context, msg.chat_id, msg.message_id)
+        return
+
+    if not msg.reply_to_message or not msg.reply_to_message.from_user:
+        await delete_message_safe(context, msg.chat_id, msg.message_id)
+        return
+
+    target = msg.reply_to_message.from_user
+
+    if await is_group_admin(context, target.id) or target.id in TRUSTED_IDS:
+        await delete_message_safe(context, msg.chat_id, msg.message_id)
+        if not await is_silent():
+            warn = await context.bot.send_message(GROUP_ID, "⛔ Action refusée : impossible de cibler un admin, owner ou trusted.")
+            await save_message(GROUP_ID, warn.message_id, None, True)
+        return
+
+    sid = await get_session_for_trusted()
+    used = await trusted_action_count(sid, actor.id, "ban")
+    if used >= 20:
+        await delete_message_safe(context, msg.chat_id, msg.message_id)
+        if not await is_silent():
+            warn = await context.bot.send_message(GROUP_ID, "⛔ Limite atteinte : 20 /ban par session.")
+            await save_message(GROUP_ID, warn.message_id, None, True)
+        return
+
+    await log_trusted_action(sid, actor.id, "ban", target.id, msg.reply_to_message.message_id)
+
+    banned_hashes = await ban_hashes_from_user_session(target.id)
+    deleted = await delete_user_session_messages(context, target.id)
+
+    try:
+        await context.bot.ban_chat_member(GROUP_ID, target.id)
+    except Exception as e:
+        print(f"TRUSTED BAN ERROR: {e}", flush=True)
+
+    await delete_message_safe(context, msg.chat_id, msg.reply_to_message.message_id)
+    await delete_message_safe(context, msg.chat_id, msg.message_id)
+    await add_danger(target.id, 20, "trusted ban")
+    await increment_ban_count()
+
+    if not await is_silent():
+        note = await context.bot.send_message(
+            GROUP_ID,
+            f"🚫 Ban trusted appliqué. {deleted} message(s) supprimé(s), {banned_hashes} hash média interdit(s)."
+        )
+        await save_message(GROUP_ID, note.message_id, None, True)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1411,6 +1636,8 @@ def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("supprime", trusted_supprime, filters=filters.Chat(GROUP_ID)))
+    app.add_handler(CommandHandler("ban", trusted_ban, filters=filters.Chat(GROUP_ID)))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE, handle_private_admin))
     app.add_handler(MessageHandler(filters.Chat(GROUP_ID) & ~filters.COMMAND, handle_group_message))
