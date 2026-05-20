@@ -35,7 +35,7 @@ from telegram.ext import (
     filters,
 )
 
-APP_VERSION = "FINAL_COMPLETE_V20"
+APP_VERSION = "FINAL_COMPLETE_V21"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").replace("@", "")
@@ -276,6 +276,15 @@ async def init_db():
         for level in (1, 10, 50, 60):
             await con.execute("INSERT INTO reward_links(level,url) VALUES($1,'') ON CONFLICT(level) DO NOTHING", level)
 
+        # SCHEMA HARDENING V21
+        await con.execute("ALTER TABLE IF EXISTS media_hashes ADD COLUMN IF NOT EXISTS hash TEXT")
+        await con.execute("ALTER TABLE IF EXISTS media_hashes ADD COLUMN IF NOT EXISTS user_id BIGINT")
+        await con.execute("ALTER TABLE IF EXISTS media_hashes ADD COLUMN IF NOT EXISTS media_type TEXT")
+        await con.execute("ALTER TABLE IF EXISTS media_hashes ADD COLUMN IF NOT EXISTS used_for_participation BOOLEAN DEFAULT FALSE")
+        await con.execute("ALTER TABLE IF EXISTS banned_hashes ADD COLUMN IF NOT EXISTS hash TEXT")
+        await con.execute("ALTER TABLE IF EXISTS banned_hashes ADD COLUMN IF NOT EXISTS media_type TEXT")
+        await con.execute("ALTER TABLE IF EXISTS banned_hashes ADD COLUMN IF NOT EXISTS reason TEXT")
+
         tables = await con.fetch("""
         SELECT table_name FROM information_schema.tables
         WHERE table_schema='public'
@@ -462,7 +471,41 @@ async def send_temp_message(context, chat_id, text, seconds=45):
 async def delete_message_safe(context, chat_id, message_id):
     try:
         await context.bot.delete_message(chat_id, message_id)
+        try:
+            async with db_pool.acquire() as con:
+                await con.execute(
+                    "DELETE FROM messages WHERE chat_id=$1 AND message_id=$2",
+                    chat_id,
+                    message_id,
+                )
+        except Exception as db_e:
+            print(f"DELETE SQL CLEANUP FAILED {message_id}: {db_e}", flush=True)
         return True
+
+    except BadRequest as e:
+        err = str(e).lower()
+        if (
+            "message to delete not found" in err
+            or "message can't be deleted" in err
+            or "message identifier is not specified" in err
+            or "message not found" in err
+            or "not found" in err
+        ):
+            try:
+                async with db_pool.acquire() as con:
+                    await con.execute(
+                        "DELETE FROM messages WHERE chat_id=$1 AND message_id=$2",
+                        chat_id,
+                        message_id,
+                    )
+            except Exception as db_e:
+                print(f"DELETE SQL CLEANUP FAILED {message_id}: {db_e}", flush=True)
+            print(f"DELETE SKIPPED/CLEANED {message_id}: {e}", flush=True)
+            return False
+
+        print(f"DELETE FAILED {message_id}: {e}", flush=True)
+        return False
+
     except Exception as e:
         print(f"DELETE FAILED {message_id}: {e}", flush=True)
         return False
@@ -1572,7 +1615,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                         "♻️ Ce média a déjà été envoyé. Merci de participer avec un contenu nouveau."
                     )
                 else:
-                    warn = await context.bot.send_message(GROUP_ID, "♻️ Merci d’envoyer un média qui n’a pas déjà été partagé dans le groupe ! Les médias vus et revus ne seront pas acceptés ici.")
+                    warn = await context.bot.send_message(GROUP_ID, "♻️ C’est du vu et déjà vu.")
                 await save_message(GROUP_ID, warn.message_id, None, True)
                 await add_danger(user.id, 2, "repost média")
                 return
@@ -1601,7 +1644,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 await send_temp_message(
                     context,
                     GROUP_ID,
-                    "Merci d’envoyer un média avant de faire le moindre commentaire. Merci également de lire les règles : un bannissement peut arriver très rapidement.",
+                    "Merci de participer avant d’envoyer un message.",
                     seconds=45
                 )
                 await add_danger(user.id, 1, "message avant participation")

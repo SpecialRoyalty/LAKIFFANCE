@@ -1,4 +1,4 @@
-# Telegram Railway Bot - FINAL_COMPLETE_V20
+# Telegram Railway Bot - FINAL_COMPLETE_V21
 
 Version cohérente nettoyée.
 
@@ -31,7 +31,7 @@ Version cohérente nettoyée.
 
 Dans les logs :
 
-STARTING FINAL_COMPLETE_V20
+STARTING FINAL_COMPLETE_V21
 
 Si tu vois encore `Vidéos : x/60`, c'est que Railway tourne encore sur une ancienne version.
 
@@ -69,3 +69,14 @@ Message d'avertissement enrichi :
 - compteur total déjà supprimés
 - état kick automatique ON/OFF
 - limite 20 suppressions/jour
+
+
+## V21 - Suppression robuste + DB propre
+
+- Si Telegram répond `Message to delete not found`, le bot nettoie l'entrée PostgreSQL et continue.
+- Plus de blocage de fermeture à cause d'anciens messages déjà supprimés.
+- Ajout d'un durcissement du schéma au démarrage avec `ADD COLUMN IF NOT EXISTS`.
+- Compatible base neuve et ancienne base partiellement migrée.
+
+Vérification Railway :
+STARTING FINAL_COMPLETE_V21
