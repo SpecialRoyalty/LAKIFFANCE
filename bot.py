@@ -35,7 +35,7 @@ from telegram.ext import (
     filters,
 )
 
-APP_VERSION = "FINAL_COMPLETE_V21"
+APP_VERSION = "FINAL_COMPLETE_V22"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").replace("@", "")
@@ -116,10 +116,12 @@ async def init_db():
         """)
         await con.execute("""
         CREATE TABLE IF NOT EXISTS media_hashes(
-            id SERIAL PRIMARY KEY,
-            chat_id BIGINT NOT NULL,
-            file_unique_id TEXT NOT NULL,
+            hash TEXT PRIMARY KEY,
+            chat_id BIGINT,
+            user_id BIGINT,
             message_id BIGINT,
+            media_type TEXT,
+            used_for_participation BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT NOW()
         )
         """)
@@ -275,15 +277,100 @@ async def init_db():
 
         for level in (1, 10, 50, 60):
             await con.execute("INSERT INTO reward_links(level,url) VALUES($1,'') ON CONFLICT(level) DO NOTHING", level)
-
-        # SCHEMA HARDENING V21
+        # SCHEMA REPAIR V22
+        # Corrige automatiquement les DB Railway ayant gardé d'anciens schémas.
         await con.execute("ALTER TABLE IF EXISTS media_hashes ADD COLUMN IF NOT EXISTS hash TEXT")
+        await con.execute("ALTER TABLE IF EXISTS media_hashes ADD COLUMN IF NOT EXISTS chat_id BIGINT")
         await con.execute("ALTER TABLE IF EXISTS media_hashes ADD COLUMN IF NOT EXISTS user_id BIGINT")
+        await con.execute("ALTER TABLE IF EXISTS media_hashes ADD COLUMN IF NOT EXISTS message_id BIGINT")
         await con.execute("ALTER TABLE IF EXISTS media_hashes ADD COLUMN IF NOT EXISTS media_type TEXT")
         await con.execute("ALTER TABLE IF EXISTS media_hashes ADD COLUMN IF NOT EXISTS used_for_participation BOOLEAN DEFAULT FALSE")
+        await con.execute("ALTER TABLE IF EXISTS media_hashes ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()")
+
         await con.execute("ALTER TABLE IF EXISTS banned_hashes ADD COLUMN IF NOT EXISTS hash TEXT")
         await con.execute("ALTER TABLE IF EXISTS banned_hashes ADD COLUMN IF NOT EXISTS media_type TEXT")
         await con.execute("ALTER TABLE IF EXISTS banned_hashes ADD COLUMN IF NOT EXISTS reason TEXT")
+        await con.execute("ALTER TABLE IF EXISTS banned_hashes ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()")
+
+        # Nettoyage des lignes inutilisables avant création des index uniques.
+        await con.execute("DELETE FROM media_hashes WHERE hash IS NULL OR hash = ''")
+        await con.execute("DELETE FROM banned_hashes WHERE hash IS NULL OR hash = ''")
+
+        # Suppression doublons si ancienne table avait plusieurs fois le même hash.
+        await con.execute("""
+        DELETE FROM media_hashes a
+        USING media_hashes b
+        WHERE a.ctid < b.ctid AND a.hash = b.hash
+        """)
+        await con.execute("""
+        DELETE FROM banned_hashes a
+        USING banned_hashes b
+        WHERE a.ctid < b.ctid AND a.hash = b.hash
+        """)
+
+        # Contraintes uniques requises pour ON CONFLICT(hash).
+        await con.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint WHERE conname = 'media_hashes_hash_unique'
+            ) THEN
+                ALTER TABLE media_hashes ADD CONSTRAINT media_hashes_hash_unique UNIQUE(hash);
+            END IF;
+        END $$;
+        """)
+        await con.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint WHERE conname = 'banned_hashes_hash_unique'
+            ) THEN
+                ALTER TABLE banned_hashes ADD CONSTRAINT banned_hashes_hash_unique UNIQUE(hash);
+            END IF;
+        END $$;
+        """)
+
+        # Contraintes supplémentaires pour les autres ON CONFLICT.
+        await con.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint WHERE conname = 'settings_key_unique'
+            ) THEN
+                ALTER TABLE settings ADD CONSTRAINT settings_key_unique UNIQUE(key);
+            END IF;
+        END $$;
+        """)
+        await con.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint WHERE conname = 'reward_links_level_unique'
+            ) THEN
+                ALTER TABLE reward_links ADD CONSTRAINT reward_links_level_unique UNIQUE(level);
+            END IF;
+        END $$;
+        """)
+        await con.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint WHERE conname = 'referral_links_user_unique'
+            ) THEN
+                ALTER TABLE referral_links ADD CONSTRAINT referral_links_user_unique UNIQUE(user_id);
+            END IF;
+        END $$;
+        """)
+        await con.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint WHERE conname = 'user_rewards_user_unique'
+            ) THEN
+                ALTER TABLE user_rewards ADD CONSTRAINT user_rewards_user_unique UNIQUE(user_id);
+            END IF;
+        END $$;
+        """)
 
         tables = await con.fetch("""
         SELECT table_name FROM information_schema.tables

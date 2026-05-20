@@ -1,4 +1,4 @@
-# Telegram Railway Bot - FINAL_COMPLETE_V21
+# Telegram Railway Bot - FINAL_COMPLETE_V22
 
 Version cohérente nettoyée.
 
@@ -31,7 +31,7 @@ Version cohérente nettoyée.
 
 Dans les logs :
 
-STARTING FINAL_COMPLETE_V21
+STARTING FINAL_COMPLETE_V22
 
 Si tu vois encore `Vidéos : x/60`, c'est que Railway tourne encore sur une ancienne version.
 
@@ -79,4 +79,31 @@ Message d'avertissement enrichi :
 - Compatible base neuve et ancienne base partiellement migrée.
 
 Vérification Railway :
-STARTING FINAL_COMPLETE_V21
+STARTING FINAL_COMPLETE_V22
+
+
+## V22 - Correction complète SQL / hash / anti-repost
+
+Correction complète :
+- `media_hashes.hash` existe toujours.
+- `banned_hashes.hash` existe toujours.
+- `hash` est en TEXT.
+- `hash` est UNIQUE.
+- `ON CONFLICT(hash)` fonctionne.
+- anti-repost refonctionne.
+- ban hash refonctionne.
+- participation avec média nouveau refonctionne.
+- nettoyage automatique des vieilles lignes nulles/doublons.
+- réparation automatique des anciennes DB Railway partiellement migrées.
+
+Important :
+- si tu veux repartir 100% propre, tu peux supprimer toutes les tables puis relancer.
+- sinon V22 tente de réparer automatiquement le schéma.
+
+Vérification Railway :
+STARTING FINAL_COMPLETE_V22
+
+Test rapide :
+1. envoie une photo ;
+2. renvoie exactement la même photo ;
+3. le bot doit supprimer la deuxième avec `♻️ C’est du vu et déjà vu.`
