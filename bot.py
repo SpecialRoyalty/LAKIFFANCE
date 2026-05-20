@@ -1572,7 +1572,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                         "♻️ Ce média a déjà été envoyé. Merci de participer avec un contenu nouveau."
                     )
                 else:
-                    warn = await context.bot.send_message(GROUP_ID, "♻️ C’est du vu et déjà vu.")
+                    warn = await context.bot.send_message(GROUP_ID, "♻️ Merci d’envoyer un média qui n’a pas déjà été partagé dans le groupe ! Les médias vus et revus ne seront pas acceptés ici.")
                 await save_message(GROUP_ID, warn.message_id, None, True)
                 await add_danger(user.id, 2, "repost média")
                 return
@@ -1601,7 +1601,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 await send_temp_message(
                     context,
                     GROUP_ID,
-                    "Merci de participer avant d’envoyer un message.",
+                    "Merci d’envoyer un média avant de faire le moindre commentaire. Merci également de lire les règles : un bannissement peut arriver très rapidement.",
                     seconds=45
                 )
                 await add_danger(user.id, 1, "message avant participation")
