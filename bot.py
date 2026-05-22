@@ -1,5 +1,5 @@
 
-# Horaires dynamiques V14b
+# Horaires dynamiques V14
 def get_schedule_for_day(now):
     wd = now.weekday()
 
@@ -35,7 +35,7 @@ from telegram.ext import (
     filters,
 )
 
-APP_VERSION = "FINAL_COMPLETE_V24"
+APP_VERSION = "FINAL_COMPLETE_V27"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").replace("@", "")
@@ -46,6 +46,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", "8080"))
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Paris")
+MAX_HASH_FILE_MB = int(os.getenv("MAX_HASH_FILE_MB", "20"))
+
 TZ = ZoneInfo(TIMEZONE)
 
 db_pool = None
@@ -259,6 +261,9 @@ async def init_db():
             "rules_message_id": "0",
             "last_countdown_key": "",
             "ban_report_count": "0",
+            "session_deletions": "0",
+            "session_exclusions": "0",
+            "session_mutes": "0",
             "non_participants_kicked_total": "0",
             "nonparticipant_kicked_today": "0",
             "last_nonparticipant_kick_date": "",
@@ -486,6 +491,18 @@ async def add_danger(user_id, points, reason):
         ON CONFLICT(user_id) DO UPDATE SET score=danger_scores.score+$2, reason=$3, updated_at=NOW()
         """, user_id, points, reason)
 
+
+async def increment_session_counter(key: str, amount: int = 1):
+    current = int(await get_setting(key, "0") or "0")
+    await set_setting(key, current + amount)
+
+
+async def reset_session_moderation_counters():
+    await set_setting("session_deletions", "0")
+    await set_setting("session_exclusions", "0")
+    await set_setting("session_mutes", "0")
+
+
 async def increment_ban_count():
     current = int(await get_setting("ban_report_count", "0") or "0")
     await set_setting("ban_report_count", current + 1)
@@ -513,11 +530,27 @@ async def media_hash_from_message(context, msg):
         file_id = msg.animation.file_id
     elif msg.document:
         file_id = msg.document.file_id
+
     if not file_id:
         return None
+
     tg_file = await context.bot.get_file(file_id)
-    data = await tg_file.download_as_bytearray()
+
+    size = getattr(tg_file, "file_size", None)
+    if size and size > MAX_HASH_FILE_MB * 1024 * 1024:
+        print(f"HASH SKIPPED: file too big ({size} bytes > {MAX_HASH_FILE_MB} MB)", flush=True)
+        return None
+
+    try:
+        data = await tg_file.download_as_bytearray()
+    except Exception as e:
+        if "file is too big" in str(e).lower():
+            print("HASH SKIPPED: file too big", flush=True)
+            return None
+        raise
+
     return hashlib.sha256(bytes(data)).hexdigest()
+
 
 async def reward_links_ready():
     async with db_pool.acquire() as con:
@@ -848,6 +881,8 @@ async def delete_user_session_messages(context: ContextTypes.DEFAULT_TYPE, targe
         if await delete_message_safe(context, r["chat_id"], r["message_id"]):
             deleted += 1
         await asyncio.sleep(0.03)
+    if deleted:
+        await increment_session_counter("session_deletions", deleted)
     return deleted
 
 
@@ -914,6 +949,7 @@ async def trusted_supprime(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await delete_message_safe(context, msg.chat_id, msg.reply_to_message.message_id)
+    await increment_session_counter("session_deletions")  # trusted_supprime
     await delete_message_safe(context, msg.chat_id, msg.message_id)
     await log_trusted_action(sid, actor.id, "supprime", target.id, msg.reply_to_message.message_id)
 
@@ -990,14 +1026,16 @@ async def trusted_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"TRUSTED BAN ERROR: {e}", flush=True)
 
     await delete_message_safe(context, msg.chat_id, msg.reply_to_message.message_id)
+    await increment_session_counter("session_deletions")  # trusted_supprime
     await delete_message_safe(context, msg.chat_id, msg.message_id)
     await add_danger(target.id, 20, "trusted ban")
     await increment_ban_count()
+    await increment_session_counter("session_exclusions")
 
     if not await is_silent():
         note = await context.bot.send_message(
             GROUP_ID,
-            f"🚫 Ban trusted appliqué."
+            f"🚫 Ban trusted appliqué. {deleted} message(s) supprimé(s), {banned_hashes} hash média interdit(s)."
         )
         await save_message(GROUP_ID, note.message_id, None, True)
 
@@ -1146,6 +1184,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------- GROUP OPEN / CLOSE ----------------
 
 async def open_group(context: ContextTypes.DEFAULT_TYPE):
+    await reset_session_moderation_counters()
     await delete_last_system_message(context)
 
     sid = await create_session()
@@ -1226,7 +1265,7 @@ async def send_trusted_session_report(context: ContextTypes.DEFAULT_TYPE, sessio
         try:
             await context.bot.send_message(admin_id, text)
         except Exception as e:
-            print(f"TRUSTED REPORT SEND ERROR admin={admin_id}: {e}", flush=True)
+            print(f"TRUSTED REPORT SKIPPED admin={admin_id}: admin must start the bot in private first ({e})", flush=True)
 
 async def close_group_and_clean(context: ContextTypes.DEFAULT_TYPE):
     sid = await current_session_id()
@@ -1533,8 +1572,8 @@ async def save_user_message_if_session(update: Update):
 # PUBLIC MESSAGES V24
 # =========================
 
-MSG_PARTICIPATION_REQUIRED = "⚠️ Merci de participer avant d’envoyer un message.\nEnvoyez au moins 1 photo ou 1 vidéo FR jamais publiée."
-MSG_REPOST = "♻️ Ce média a déjà été publié.Merci d'envoyez un média FR et surtout qui n'a pas tourné 328371 fois"
+MSG_PARTICIPATION_REQUIRED = "⚠️ Merci de participer avant d’envoyer un message.\nEnvoyez au moins 1 photo ou 1 vidéo jamais publiée."
+MSG_REPOST = "♻️ Ce média a déjà été publié."
 MSG_LINK_FORBIDDEN = "🔗 Les liens ne sont pas autorisés."
 MSG_FORWARD_FORBIDDEN = "🚫 Les transferts ne sont pas autorisés."
 MSG_GENERIC_FORBIDDEN = "🚫 Message non autorisé."
@@ -1555,7 +1594,7 @@ def clean_public_reason(reason: str) -> str:
     }
     return mapping.get(reason, MSG_GENERIC_FORBIDDEN)
 
-async def punish_ban(update, context, reason):
+async def punish_ban(update, context, reason, custom_message=None):
     user = update.effective_user
     if not user:
         return
@@ -1573,7 +1612,7 @@ async def punish_ban(update, context, reason):
 
     msg = await context.bot.send_message(
         update.effective_chat.id,
-        clean_public_reason(reason),
+        custom_message or clean_public_reason(reason),
         parse_mode="HTML",
     )
     await save_message(update.effective_chat.id, msg.message_id, None, True)
@@ -1599,10 +1638,12 @@ async def punish_word(update, context):
         until = datetime.now(TZ) + timedelta(days=1)
         await context.bot.restrict_chat_member(update.effective_chat.id, user.id, ChatPermissions(can_send_messages=False), until_date=until)
         action = "mute 1 jour"
+        await increment_session_counter("session_mutes")
     elif count == 2:
         until = datetime.now(TZ) + timedelta(days=7)
         await context.bot.restrict_chat_member(update.effective_chat.id, user.id, ChatPermissions(can_send_messages=False), until_date=until)
         action = "mute 1 semaine"
+        await increment_session_counter("session_mutes")
     else:
         await context.bot.ban_chat_member(update.effective_chat.id, user.id)
         action = "ban"
@@ -1677,9 +1718,10 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         or getattr(msg, "forward_from", None)
         or getattr(msg, "forward_from_chat", None)
     )
+    # V25: les transferts sont autorisés, pas de sanction.
     if is_forward:
-        await punish_ban(update, context, "transfert interdit")
-        return
+        pass
+
 
     # 6) Photo + mention prioritaire.
     if await get_setting("anti_photo_mention", "on") == "on":
@@ -1723,6 +1765,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
             if old:
                 await delete_message_safe(context, GROUP_ID, msg.message_id)
+                await increment_session_counter("session_deletions")
                 if await get_setting("participation", "off") == "on" and not await has_participated(user.id):
                     warn = await context.bot.send_message(
                         GROUP_ID,
@@ -1755,6 +1798,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         if not await has_participated(user.id):
             if not message_is_photo_or_video(msg):
                 await delete_message_safe(context, GROUP_ID, msg.message_id)
+                await increment_session_counter("session_deletions")
                 await send_temp_message(
                     context,
                     GROUP_ID,
@@ -1936,7 +1980,7 @@ async def kick_old_non_participants(context):
             try:
                 await context.bot.send_message(admin_id, report)
             except Exception as e:
-                print(f"KICK REPORT SEND ERROR admin={admin_id}: {e}", flush=True)
+                print(f"KICK REPORT SKIPPED admin={admin_id}: admin must start the bot in private first ({e})", flush=True)
 
 
 async def post_rules(context):
@@ -1957,11 +2001,27 @@ async def post_rules(context):
 async def ban_report(context):
     if await get_setting("group_open", "off") != "on":
         return
-    count = int(await get_setting("ban_report_count", "0") or "0")
-    if count <= 0:
+
+    deletions = int(await get_setting("session_deletions", "0") or "0")
+    exclusions = int(await get_setting("session_exclusions", "0") or "0")
+    mutes = int(await get_setting("session_mutes", "0") or "0")
+
+    if deletions <= 0 and exclusions <= 0 and mutes <= 0:
         return
-    msg = await context.bot.send_message(GROUP_ID, f"⚠️ Bilan sécurité : {count} sanction(s) automatique(s) depuis l'ouverture. Respectez les règles.")
+
+    text = (
+        "⚠️ Veuillez respecter les règles du groupe.\n\n"
+        "🛡️ Modération active :\n"
+        f"• {deletions} suppressions\n"
+        f"• {exclusions} exclusions\n"
+        f"• {mutes} restrictions\n\n"
+        "Merci de faire attention."
+    )
+
+    msg = await context.bot.send_message(GROUP_ID, text)
     await save_message(GROUP_ID, msg.message_id, None, True)
+    context.application.create_task(delete_later(context, GROUP_ID, msg.message_id, 180))
+
 
 # ---------------- SCHEDULE ----------------
 
