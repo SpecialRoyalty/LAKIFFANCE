@@ -997,7 +997,7 @@ async def trusted_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_silent():
         note = await context.bot.send_message(
             GROUP_ID,
-            f"🚫 Ban trusted appliqué. {deleted} message(s) supprimé(s), {banned_hashes} hash média interdit(s)."
+            f"🚫 Ban trusted appliqué."
         )
         await save_message(GROUP_ID, note.message_id, None, True)
 
