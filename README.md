@@ -1,4 +1,4 @@
-# Telegram Railway Bot - FINAL_COMPLETE_V27
+# Telegram Railway Bot - FINAL_COMPLETE_V29
 
 Version cohérente nettoyée.
 
@@ -31,7 +31,7 @@ Version cohérente nettoyée.
 
 Dans les logs :
 
-STARTING FINAL_COMPLETE_V27
+STARTING FINAL_COMPLETE_V29
 
 Si tu vois encore `Vidéos : x/60`, c'est que Railway tourne encore sur une ancienne version.
 
@@ -79,7 +79,7 @@ Message d'avertissement enrichi :
 - Compatible base neuve et ancienne base partiellement migrée.
 
 Vérification Railway :
-STARTING FINAL_COMPLETE_V27
+STARTING FINAL_COMPLETE_V29
 
 
 ## V22 - Correction complète SQL / hash / anti-repost
@@ -101,7 +101,7 @@ Important :
 - sinon V22 tente de réparer automatiquement le schéma.
 
 Vérification Railway :
-STARTING FINAL_COMPLETE_V27
+STARTING FINAL_COMPLETE_V29
 
 Test rapide :
 1. envoie une photo ;
@@ -128,7 +128,7 @@ Changements :
   - plus de spam mode raid.
 
 Vérification Railway :
-STARTING FINAL_COMPLETE_V27
+STARTING FINAL_COMPLETE_V29
 
 
 ## V24 - Textes runtime corrigés
@@ -169,7 +169,7 @@ Correction incluse :
 - fix `MSG_FAKE_COMMAND` si la V24 contenait l'auto-référence cassée.
 
 Vérification Railway :
-STARTING FINAL_COMPLETE_V27
+STARTING FINAL_COMPLETE_V29
 
 
 ## V26 - Fix punish_ban + rapports admin
@@ -182,7 +182,7 @@ Corrections :
 - Transferts toujours autorisés comme en V25.
 
 Vérification Railway :
-STARTING FINAL_COMPLETE_V27
+STARTING FINAL_COMPLETE_V29
 
 
 ## V27 - Hash robuste + message dissuasion modération
@@ -201,4 +201,33 @@ Message dissuasion :
 - affiche suppressions, exclusions et restrictions.
 
 Vérification Railway :
-STARTING FINAL_COMPLETE_V27
+STARTING FINAL_COMPLETE_V29
+
+
+## V28 - Fix trusted mute
+
+Correction :
+- Les TRUSTED_IDS ne sont plus touchés par le mute anti-commandes `/`.
+- `/supprimer` devient un alias officiel de `/supprime`.
+- `/ban`, `/supprime` et `/supprimer` restent réservés aux trusted/admins.
+- Un non-trusted qui tente ces commandes reste mute 2 jours.
+- Un trusted qui utilise ces commandes n'est jamais mute par ce système.
+
+Vérification Railway :
+STARTING FINAL_COMPLETE_V29
+
+
+## V29 - Priorité média interdit + trusted silencieux
+
+Corrections :
+- `banned_hashes` est vérifié AVANT `media_hashes`.
+- Si un média interdit est republié : ban direct, même s'il était déjà connu comme repost.
+- Quand un admin ajoute un média interdit, le même hash est retiré de `media_hashes`.
+- `/ban` trusted : totalement silencieux dans le groupe.
+- `/supprime` / `/supprimer` trusted : totalement silencieux dans le groupe.
+- Aucune phrase publique ne parle de hash.
+- Trusted jamais mute par les commandes.
+- `/supprimer` reste alias officiel de `/supprime`.
+
+Vérification Railway :
+STARTING FINAL_COMPLETE_V29

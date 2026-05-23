@@ -35,7 +35,7 @@ from telegram.ext import (
     filters,
 )
 
-APP_VERSION = "FINAL_COMPLETE_V27"
+APP_VERSION = "FINAL_COMPLETE_V29"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").replace("@", "")
@@ -802,7 +802,7 @@ async def panel_text(extra=""):
         f"🔗 Liens récompenses : {'✅ complets' if links_ready else '❌ incomplets'}\n"
         f"💬 Messages session stockés : {msg_count}\n"
         f"🚫 Mots interdits : {words}\n"
-        f"🚫 Hash bannis : {banned_hashes}\n"
+        f"🚫 Média interdits : {banned_hashes}\n"
         f"🎭 Non-participants : {non_participants}\n"
         f"🔗 Liens privés : {links}\n"
         f"✅ Parrainages validés : {valid_refs}\n"
@@ -975,14 +975,6 @@ async def trusted_supprime(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         deleted = await delete_user_session_messages(context, target.id)
         await add_danger(target.id, 5, "trusted strikes")
-        if not await is_silent():
-            note = await context.bot.send_message(
-                GROUP_ID,
-                f"🔇 Utilisateur sanctionné : mute 7 jours. {deleted} message(s) supprimé(s)."
-            )
-            await save_message(GROUP_ID, note.message_id, None, True)
-
-
 async def trusted_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     actor = update.effective_user
@@ -1031,14 +1023,6 @@ async def trusted_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await add_danger(target.id, 20, "trusted ban")
     await increment_ban_count()
     await increment_session_counter("session_exclusions")
-
-    if not await is_silent():
-        note = await context.bot.send_message(
-            GROUP_ID,
-            f"🚫 Ban trusted appliqué. {deleted} message(s) supprimé(s), {banned_hashes} hash média interdit(s)."
-        )
-        await save_message(GROUP_ID, note.message_id, None, True)
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -1522,14 +1506,20 @@ async def handle_private_admin(update: Update, context: ContextTypes.DEFAULT_TYP
             await msg.reply_text("❌ Envoie une photo ou une vidéo.")
             return
         h = await media_hash_from_message(context, msg)
+        if not h:
+            await msg.reply_text("❌ Ce média est trop gros ou impossible à analyser.")
+            return
+
         async with db_pool.acquire() as con:
             await con.execute("""
             INSERT INTO banned_hashes(hash,media_type,reason)
             VALUES($1,$2,$3)
             ON CONFLICT(hash) DO UPDATE SET reason=$3
-            """, h, media_type(msg), "hash interdit admin")
+            """, h, media_type(msg), "média interdit admin")
+            await con.execute("DELETE FROM media_hashes WHERE hash=$1", h)
+
         await set_admin_state(user.id, None)
-        await msg.reply_text("✅ ✅ Média interdit enregistré.")
+        await msg.reply_text("✅ Média interdit enregistré.")
         return
     if message_has_media(msg):
         await msg.reply_text("ℹ️ Média reçu, mais aucun mode actif. Pour bannir un hash, clique d’abord sur 🚫 Ban hash dans le panel.")
@@ -1588,7 +1578,7 @@ def clean_public_reason(reason: str) -> str:
         "transfert interdit": MSG_FORWARD_FORBIDDEN,
         "transfert interdit": MSG_FORWARD_FORBIDDEN,
         "mot interdit": MSG_GENERIC_FORBIDDEN,
-        "hash interdit": MSG_GENERIC_FORBIDDEN,
+        "média interdit": MSG_GENERIC_FORBIDDEN,
         "photo avec identification interdite": MSG_GENERIC_FORBIDDEN,
         "photo avec identification interdite": MSG_GENERIC_FORBIDDEN,
     }
@@ -1675,7 +1665,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     admin_exempt = await is_group_admin(context, user.id)
 
     # 2) Les autres commandes / sont supprimées. Récidive = mute 1 mois.
-    if msg.text and msg.text.startswith("/") and not admin_exempt:
+    if msg.text and msg.text.startswith("/") and not admin_exempt and not is_trusted_id(user.id):
         await delete_message_safe(context, GROUP_ID, msg.message_id)
         async with db_pool.acquire() as con:
             row = await con.fetchrow("SELECT score FROM danger_scores WHERE user_id=$1", user.id)
@@ -1743,6 +1733,9 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             print(f"HASH ERROR: {e}", flush=True)
 
     if h:
+        # V29 IMPORTANT :
+        # 1. média interdit => ban direct
+        # 2. seulement ensuite repost normal => suppression simple
         async with db_pool.acquire() as con:
             banned = await con.fetchrow("SELECT hash FROM banned_hashes WHERE hash=$1", h)
 
@@ -1750,8 +1743,8 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await punish_ban(
                 update,
                 context,
-                "hash interdit",
-                MSG_GENERIC_FORBIDDEN
+                "média interdit",
+                MSG_GENERIC_FORBIDDEN if "MSG_GENERIC_FORBIDDEN" in globals() else "🚫 Message non autorisé."
             )
             return
 
@@ -1765,14 +1758,14 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
             if old:
                 await delete_message_safe(context, GROUP_ID, msg.message_id)
-                await increment_session_counter("session_deletions")
-                if await get_setting("participation", "off") == "on" and not await has_participated(user.id):
-                    warn = await context.bot.send_message(
-                        GROUP_ID,
-                        MSG_REPOST
-                    )
-                else:
-                    warn = await context.bot.send_message(GROUP_ID, MSG_REPOST)
+                try:
+                    await increment_session_counter("session_deletions")
+                except Exception:
+                    pass
+                warn = await context.bot.send_message(
+                    GROUP_ID,
+                    MSG_REPOST if "MSG_REPOST" in globals() else "♻️ Ce média a déjà été publié."
+                )
                 await save_message(GROUP_ID, warn.message_id, None, True)
                 await add_danger(user.id, 2, "repost média")
                 return
@@ -2148,6 +2141,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("supprime", trusted_supprime, filters=filters.Chat(GROUP_ID)))
+    app.add_handler(CommandHandler("supprimer", trusted_supprime, filters=filters.Chat(GROUP_ID)))
     app.add_handler(CommandHandler("ban", trusted_ban, filters=filters.Chat(GROUP_ID)))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE, handle_private_admin))
