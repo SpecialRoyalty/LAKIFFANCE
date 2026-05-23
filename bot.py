@@ -19,8 +19,12 @@ import os
 import re
 import asyncio
 import hashlib
+import tempfile
+from io import BytesIO
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from PIL import Image
+import cv2
 
 import asyncpg
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
@@ -35,7 +39,7 @@ from telegram.ext import (
     filters,
 )
 
-APP_VERSION = "FINAL_COMPLETE_V29"
+APP_VERSION = "FINAL_COMPLETE_V31_PURGE"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").replace("@", "")
@@ -520,36 +524,241 @@ def media_type(msg):
     if msg.document: return "document"
     return "unknown"
 
-async def media_hash_from_message(context, msg):
-    file_id = None
-    if msg.photo:
-        file_id = msg.photo[-1].file_id
-    elif msg.video:
-        file_id = msg.video.file_id
-    elif msg.animation:
-        file_id = msg.animation.file_id
-    elif msg.document:
-        file_id = msg.document.file_id
-
-    if not file_id:
-        return None
-
-    tg_file = await context.bot.get_file(file_id)
-
-    size = getattr(tg_file, "file_size", None)
-    if size and size > MAX_HASH_FILE_MB * 1024 * 1024:
-        print(f"HASH SKIPPED: file too big ({size} bytes > {MAX_HASH_FILE_MB} MB)", flush=True)
-        return None
-
+def _average_hash_image(img: Image.Image) -> str | None:
     try:
-        data = await tg_file.download_as_bytearray()
+        img = img.convert("L").resize((8, 8))
+        pixels = list(img.getdata())
+        avg = sum(pixels) / len(pixels)
+        bits = 0
+        for p in pixels:
+            bits = (bits << 1) | (1 if p >= avg else 0)
+        return f"{bits:016x}"
+    except Exception as e:
+        print(f"AHASH SKIPPED: {e}", flush=True)
+        return None
+
+
+def _average_hash_from_bytes(data: bytes) -> str | None:
+    try:
+        return _average_hash_image(Image.open(BytesIO(data)))
+    except Exception as e:
+        print(f"AHASH SKIPPED: {e}", flush=True)
+        return None
+
+
+def _hamming_hex(a: str, b: str) -> int:
+    try:
+        return (int(a, 16) ^ int(b, 16)).bit_count()
+    except Exception:
+        return 999
+
+
+async def _download_file_bytes_limited(context, file_id: str, purpose: str = "media") -> bytes | None:
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        size = getattr(tg_file, "file_size", None)
+        if size and size > MAX_HASH_FILE_MB * 1024 * 1024:
+            print(f"HASH SKIPPED: file too big for {purpose} ({size} bytes > {MAX_HASH_FILE_MB} MB)", flush=True)
+            return None
+        return bytes(await tg_file.download_as_bytearray())
     except Exception as e:
         if "file is too big" in str(e).lower():
-            print("HASH SKIPPED: file too big", flush=True)
+            print(f"HASH SKIPPED: file too big for {purpose}", flush=True)
             return None
-        raise
+        print(f"HASH SKIPPED: {purpose} download failed: {e}", flush=True)
+        return None
 
-    return hashlib.sha256(bytes(data)).hexdigest()
+
+def _first_frame_ahash_from_video_bytes(data: bytes) -> str | None:
+    """
+    V30_FRAMEHASH:
+    extrait la toute première frame réelle de la vidéo et calcule un aHash visuel.
+    C'est beaucoup plus fiable que SHA du fichier vidéo complet.
+    """
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+
+        cap = cv2.VideoCapture(tmp_path)
+        ok, frame = cap.read()
+        cap.release()
+
+        if not ok or frame is None:
+            print("VIDEO FRAME HASH SKIPPED: first frame unavailable", flush=True)
+            return None
+
+        # OpenCV = BGR ; PIL = RGB
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(frame_rgb)
+        return _average_hash_image(img)
+
+    except Exception as e:
+        print(f"VIDEO FRAME HASH SKIPPED: {e}", flush=True)
+        return None
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def _media_file_ids(msg):
+    main_file_id = None
+    unique_id = None
+
+    if msg.photo:
+        main_file_id = msg.photo[-1].file_id
+        unique_id = msg.photo[-1].file_unique_id
+    elif msg.video:
+        main_file_id = msg.video.file_id
+        unique_id = msg.video.file_unique_id
+    elif msg.animation:
+        main_file_id = msg.animation.file_id
+        unique_id = msg.animation.file_unique_id
+    elif msg.document:
+        main_file_id = msg.document.file_id
+        unique_id = msg.document.file_unique_id
+
+    return main_file_id, unique_id
+
+
+async def media_fingerprints_from_message(context, msg) -> list[str]:
+    """
+    Nouvelle logique :
+    - photo : hash visuel de l'image
+    - vidéo/mp4/mov : hash visuel de la toute première frame
+    - file_unique_id et SHA exact sont conservés en bonus
+    """
+    main_file_id, unique_id = _media_file_ids(msg)
+    keys = []
+
+    if unique_id:
+        keys.append(f"fu:{unique_id}")
+
+    if not main_file_id:
+        return keys
+
+    data = await _download_file_bytes_limited(context, main_file_id, "media")
+    if not data:
+        return keys
+
+    # Bonus exact : utile si c'est vraiment le même fichier Telegram.
+    keys.append("sha:" + hashlib.sha256(data).hexdigest())
+
+    if msg.photo:
+        ah = _average_hash_from_bytes(data)
+        if ah:
+            keys.insert(0, "imgahash:" + ah)
+
+    elif msg.video or msg.animation or msg.document:
+        # Pour document .mp4/.mov envoyé comme fichier, on tente aussi vidéo.
+        vh = _first_frame_ahash_from_video_bytes(data)
+        if vh:
+            keys.insert(0, "vidframe0:" + vh)
+
+    out = []
+    seen = set()
+    for k in keys:
+        if k and k not in seen:
+            out.append(k)
+            seen.add(k)
+    return out
+
+
+async def media_hash_from_message(context, msg):
+    keys = await media_fingerprints_from_message(context, msg)
+    return keys[0] if keys else None
+
+
+async def find_matching_banned_media(keys: list[str]):
+    if not keys:
+        return None
+
+    async with db_pool.acquire() as con:
+        exact = await con.fetchrow(
+            "SELECT hash FROM banned_hashes WHERE hash = ANY($1::text[]) LIMIT 1",
+            keys,
+        )
+        if exact:
+            return exact["hash"]
+
+        # Matching approximatif pour hash visuel photo / première frame vidéo.
+        visual_keys = []
+        for k in keys:
+            if k.startswith("imgahash:") or k.startswith("vidframe0:"):
+                prefix, val = k.split(":", 1)
+                visual_keys.append((prefix, val))
+
+        for prefix, val in visual_keys:
+            rows = await con.fetch("SELECT hash FROM banned_hashes WHERE hash LIKE $1", prefix + ":%")
+            for r in rows:
+                stored = r["hash"].split(":", 1)[1]
+                if _hamming_hex(stored, val) <= 6:
+                    return r["hash"]
+
+    return None
+
+
+async def find_matching_repost_media(keys: list[str]):
+    if not keys:
+        return None
+
+    async with db_pool.acquire() as con:
+        exact = await con.fetchrow("""
+            SELECT hash FROM media_hashes
+            WHERE hash = ANY($1::text[])
+              AND created_at > NOW() - INTERVAL '10 days'
+            LIMIT 1
+        """, keys)
+        if exact:
+            return exact["hash"]
+
+        visual_keys = []
+        for k in keys:
+            if k.startswith("imgahash:") or k.startswith("vidframe0:"):
+                prefix, val = k.split(":", 1)
+                visual_keys.append((prefix, val))
+
+        for prefix, val in visual_keys:
+            rows = await con.fetch("""
+                SELECT hash FROM media_hashes
+                WHERE hash LIKE $1
+                  AND created_at > NOW() - INTERVAL '10 days'
+            """, prefix + ":%")
+            for r in rows:
+                stored = r["hash"].split(":", 1)[1]
+                if _hamming_hex(stored, val) <= 6:
+                    return r["hash"]
+
+    return None
+
+
+async def insert_media_fingerprints(keys: list[str], chat_id: int, user_id: int, message_id: int, mtype: str, used_for_participation: bool):
+    if not keys:
+        return
+    async with db_pool.acquire() as con:
+        for k in keys:
+            await con.execute("""
+            INSERT INTO media_hashes(hash,chat_id,user_id,message_id,media_type,used_for_participation)
+            VALUES($1,$2,$3,$4,$5,$6)
+            ON CONFLICT(hash) DO NOTHING
+            """, k, chat_id, user_id, message_id, mtype, used_for_participation)
+
+
+async def insert_banned_media_fingerprints(keys: list[str], mtype: str, reason: str):
+    if not keys:
+        return
+    async with db_pool.acquire() as con:
+        for k in keys:
+            await con.execute("""
+            INSERT INTO banned_hashes(hash,media_type,reason)
+            VALUES($1,$2,$3)
+            ON CONFLICT(hash) DO UPDATE SET reason=$3
+            """, k, mtype, reason)
+            await con.execute("DELETE FROM media_hashes WHERE hash=$1", k)
 
 
 async def reward_links_ready():
@@ -1505,22 +1714,17 @@ async def handle_private_admin(update: Update, context: ContextTypes.DEFAULT_TYP
         if not message_has_media(msg):
             await msg.reply_text("❌ Envoie une photo ou une vidéo.")
             return
-        h = await media_hash_from_message(context, msg)
-        if not h:
+
+        keys = await media_fingerprints_from_message(context, msg)
+        if not keys:
             await msg.reply_text("❌ Ce média est trop gros ou impossible à analyser.")
             return
 
-        async with db_pool.acquire() as con:
-            await con.execute("""
-            INSERT INTO banned_hashes(hash,media_type,reason)
-            VALUES($1,$2,$3)
-            ON CONFLICT(hash) DO UPDATE SET reason=$3
-            """, h, media_type(msg), "média interdit admin")
-            await con.execute("DELETE FROM media_hashes WHERE hash=$1", h)
-
+        await insert_banned_media_fingerprints(keys, media_type(msg), "média interdit admin")
         await set_admin_state(user.id, None)
         await msg.reply_text("✅ Média interdit enregistré.")
         return
+
     if message_has_media(msg):
         await msg.reply_text("ℹ️ Média reçu, mais aucun mode actif. Pour bannir un hash, clique d’abord sur 🚫 Ban hash dans le panel.")
         return
@@ -1724,22 +1928,16 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await punish_ban(update, context, "photo avec identification interdite")
             return
 
-    # 7) Hash média : ban hash puis anti-repost avant participation.
+    # 7) Empreintes média : média interdit avant repost simple.
+    media_keys = []
     h = None
     if message_has_media(msg):
-        try:
-            h = await media_hash_from_message(context, msg)
-        except Exception as e:
-            print(f"HASH ERROR: {e}", flush=True)
+        media_keys = await media_fingerprints_from_message(context, msg)
+        h = media_keys[0] if media_keys else None
 
-    if h:
-        # V29 IMPORTANT :
-        # 1. média interdit => ban direct
-        # 2. seulement ensuite repost normal => suppression simple
-        async with db_pool.acquire() as con:
-            banned = await con.fetchrow("SELECT hash FROM banned_hashes WHERE hash=$1", h)
-
-        if banned:
+    if media_keys:
+        banned_match = await find_matching_banned_media(media_keys)
+        if banned_match:
             await punish_ban(
                 update,
                 context,
@@ -1749,14 +1947,8 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
         if await get_setting("anti_repost", "on") == "on":
-            async with db_pool.acquire() as con:
-                old = await con.fetchrow("""
-                SELECT hash FROM media_hashes
-                WHERE hash=$1 AND created_at > NOW() - INTERVAL '10 days'
-                LIMIT 1
-                """, h)
-
-            if old:
+            repost_match = await find_matching_repost_media(media_keys)
+            if repost_match:
                 await delete_message_safe(context, GROUP_ID, msg.message_id)
                 try:
                     await increment_session_counter("session_deletions")
@@ -1770,12 +1962,14 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 await add_danger(user.id, 2, "repost média")
                 return
 
-        async with db_pool.acquire() as con:
-            await con.execute("""
-            INSERT INTO media_hashes(hash,chat_id,user_id,message_id,media_type,used_for_participation)
-            VALUES($1,$2,$3,$4,$5,$6)
-            ON CONFLICT(hash) DO NOTHING
-            """, h, GROUP_ID, user.id, msg.message_id, media_type(msg), bool(message_is_photo_or_video(msg)))
+        await insert_media_fingerprints(
+            media_keys,
+            GROUP_ID,
+            user.id,
+            msg.message_id,
+            media_type(msg),
+            bool(message_is_photo_or_video(msg)),
+        )
 
     # 8) Mots interdits.
     async with db_pool.acquire() as con:
