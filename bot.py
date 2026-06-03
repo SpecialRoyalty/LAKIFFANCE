@@ -1834,10 +1834,6 @@ async def publish_ad(context: ContextTypes.DEFAULT_TYPE):
 
     text = (
         "🎁 Partagez votre lien pour recevoir la rediffusion complète du groupe.\n\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n\n"
         "Cliquez ci-dessous pour recevoir votre lien personnel."
     )
 
