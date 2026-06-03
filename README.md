@@ -1,4 +1,4 @@
-# Telegram Railway Bot - FINAL_COMPLETE_V36_REDIFFUSION_CLEAN
+# Telegram Railway Bot - FINAL_COMPLETE_V37_GLOBAL_FIX
 
 Version cohérente nettoyée.
 
@@ -31,7 +31,7 @@ Version cohérente nettoyée.
 
 Dans les logs :
 
-STARTING FINAL_COMPLETE_V36_REDIFFUSION_CLEAN
+STARTING FINAL_COMPLETE_V37_GLOBAL_FIX
 
 Si tu vois encore `Vidéos : x/60`, c'est que Railway tourne encore sur une ancienne version.
 
@@ -79,7 +79,7 @@ Message d'avertissement enrichi :
 - Compatible base neuve et ancienne base partiellement migrée.
 
 Vérification Railway :
-STARTING FINAL_COMPLETE_V36_REDIFFUSION_CLEAN
+STARTING FINAL_COMPLETE_V37_GLOBAL_FIX
 
 
 ## V22 - Correction complète SQL / hash / anti-repost
@@ -101,7 +101,7 @@ Important :
 - sinon V22 tente de réparer automatiquement le schéma.
 
 Vérification Railway :
-STARTING FINAL_COMPLETE_V36_REDIFFUSION_CLEAN
+STARTING FINAL_COMPLETE_V37_GLOBAL_FIX
 
 Test rapide :
 1. envoie une photo ;
@@ -128,7 +128,7 @@ Changements :
   - plus de spam mode raid.
 
 Vérification Railway :
-STARTING FINAL_COMPLETE_V36_REDIFFUSION_CLEAN
+STARTING FINAL_COMPLETE_V37_GLOBAL_FIX
 
 
 ## V24 - Textes runtime corrigés
@@ -169,7 +169,7 @@ Correction incluse :
 - fix `MSG_FAKE_COMMAND` si la V24 contenait l'auto-référence cassée.
 
 Vérification Railway :
-STARTING FINAL_COMPLETE_V36_REDIFFUSION_CLEAN
+STARTING FINAL_COMPLETE_V37_GLOBAL_FIX
 
 
 ## V26 - Fix punish_ban + rapports admin
@@ -182,7 +182,7 @@ Corrections :
 - Transferts toujours autorisés comme en V25.
 
 Vérification Railway :
-STARTING FINAL_COMPLETE_V36_REDIFFUSION_CLEAN
+STARTING FINAL_COMPLETE_V37_GLOBAL_FIX
 
 
 ## V27 - Hash robuste + message dissuasion modération
@@ -201,7 +201,7 @@ Message dissuasion :
 - affiche suppressions, exclusions et restrictions.
 
 Vérification Railway :
-STARTING FINAL_COMPLETE_V36_REDIFFUSION_CLEAN
+STARTING FINAL_COMPLETE_V37_GLOBAL_FIX
 
 
 ## V28 - Fix trusted mute
@@ -214,7 +214,7 @@ Correction :
 - Un trusted qui utilise ces commandes n'est jamais mute par ce système.
 
 Vérification Railway :
-STARTING FINAL_COMPLETE_V36_REDIFFUSION_CLEAN
+STARTING FINAL_COMPLETE_V37_GLOBAL_FIX
 
 
 ## V29 - Priorité média interdit + trusted silencieux
@@ -230,7 +230,7 @@ Corrections :
 - `/supprimer` reste alias officiel de `/supprime`.
 
 Vérification Railway :
-STARTING FINAL_COMPLETE_V36_REDIFFUSION_CLEAN
+STARTING FINAL_COMPLETE_V37_GLOBAL_FIX
 
 
 ## V30_FRAMEHASH - Hash visuel photo + première frame vidéo
@@ -249,7 +249,7 @@ Dépendances ajoutées :
 - opencv-python-headless
 
 Vérification Railway :
-STARTING FINAL_COMPLETE_V36_REDIFFUSION_CLEAN
+STARTING FINAL_COMPLETE_V37_GLOBAL_FIX
 
 
 ## V31_PURGE - purge complète après média interdit
@@ -277,7 +277,7 @@ Rappels fermeture :
 - 5/4/3/2/1 minutes avant.
 
 Vérification Railway :
-STARTING FINAL_COMPLETE_V36_REDIFFUSION_CLEAN
+STARTING FINAL_COMPLETE_V37_GLOBAL_FIX
 
 ## V33_VIP_ADS
 
@@ -324,16 +324,22 @@ Base :
 - créations non destructives uniquement avec `CREATE TABLE IF NOT EXISTS` et `ALTER TABLE IF EXISTS ... ADD COLUMN IF NOT EXISTS`.
 
 
-## V36_REDIFFUSION_CLEAN
+## V37_GLOBAL_FIX
+
+Version corrigée globale basée sur V35 stable.
 
 Corrections :
-- suppression des anciens textes “vidéos” dans la pub ;
-- correction des `\n` visibles : vrais retours ligne Telegram ;
-- objectif campagne configurable depuis le panel ;
-- pas d'envoi privé massif lors d'un nouveau lien GoFile ;
-- Pub Mon lien et Campagne utilisent le même texte/image/bouton ;
-- nouvelle campagne = compteur remis à zéro depuis `created_at`.
+- `/start` restauré et vérifié ;
+- campagne rediffusion complète stable ;
+- objectif configurable depuis le panel ;
+- texte + image campagne configurables ;
+- pub “Mon lien” coordonnée avec la campagne ;
+- pas d’envoi privé massif lors d’un nouveau lien GoFile ;
+- anciens textes “vidéos” supprimés ;
+- vrais retours ligne Telegram ;
+- `/ban` trusted rapide, silencieux, purge + médias interdits ;
+- ban auto média interdit purge toute la session ;
+- horaires V32 conservés ;
+- migrations non destructives uniquement.
 
-Pas besoin de SQL manuel :
-- migrations non destructives uniquement ;
-- tables existantes compatibles.
+Aucune commande SQL manuelle obligatoire.

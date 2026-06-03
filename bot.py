@@ -39,7 +39,7 @@ from telegram.ext import (
     filters,
 )
 
-APP_VERSION = "FINAL_COMPLETE_V36_REDIFFUSION_CLEAN"
+APP_VERSION = "FINAL_COMPLETE_V37_GLOBAL_FIX"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").replace("@", "")
@@ -316,6 +316,9 @@ async def init_db():
             )
 
         await ensure_active_campaign()
+
+        for level in (1, 10, 50, 60):
+            await con.execute("INSERT INTO reward_links(level,url) VALUES($1,'') ON CONFLICT(level) DO NOTHING", level)
         # SCHEMA REPAIR V22
         # Corrige automatiquement les DB Railway ayant gardé d'anciens schémas.
         await con.execute("ALTER TABLE IF EXISTS media_hashes ADD COLUMN IF NOT EXISTS hash TEXT")
@@ -411,12 +414,17 @@ async def init_db():
         END $$;
         """)
 
-        await con.execute("ALTER TABLE IF EXISTS reward_campaigns ADD COLUMN IF NOT EXISTS objective INTEGER DEFAULT 50")
+        await con.execute("ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS vip_until TIMESTAMP")
+        await con.execute("ALTER TABLE IF EXISTS participants ADD COLUMN IF NOT EXISTS vip_until TIMESTAMP")
+
+        await con.execute("ALTER TABLE IF EXISTS reward_campaigns ADD COLUMN IF NOT EXISTS title TEXT DEFAULT 'Rediffusion complète du groupe'")
         await con.execute("ALTER TABLE IF EXISTS reward_campaigns ADD COLUMN IF NOT EXISTS text TEXT DEFAULT '🎁 Partagez votre lien pour recevoir la rediffusion complète du groupe.'")
         await con.execute("ALTER TABLE IF EXISTS reward_campaigns ADD COLUMN IF NOT EXISTS photo_file_id TEXT")
         await con.execute("ALTER TABLE IF EXISTS reward_campaigns ADD COLUMN IF NOT EXISTS reward_url TEXT")
-        await con.execute("ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS vip_until TIMESTAMP")
-        await con.execute("ALTER TABLE IF EXISTS participants ADD COLUMN IF NOT EXISTS vip_until TIMESTAMP")
+        await con.execute("ALTER TABLE IF EXISTS reward_campaigns ADD COLUMN IF NOT EXISTS objective INTEGER DEFAULT 50")
+        await con.execute("ALTER TABLE IF EXISTS reward_campaigns ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE")
+        await con.execute("ALTER TABLE IF EXISTS reward_campaigns ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()")
+        await con.execute("ALTER TABLE IF EXISTS reward_campaigns ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()")
 
         tables = await con.fetch("""
         SELECT table_name FROM information_schema.tables
@@ -1363,9 +1371,16 @@ async def deliver_campaign_reward_if_ready(context: ContextTypes.DEFAULT_TYPE, u
 
 
 async def notify_new_campaign(context: ContextTypes.DEFAULT_TYPE, campaign_id: int):
-    # V36 : pas d'envoi privé massif.
-    # La nouvelle campagne est annoncée via le groupe / bouton Mon lien.
-    print(f"NEW CAMPAIGN CREATED: {campaign_id}", flush=True)
+    async with db_pool.acquire() as con:
+        rows = await con.fetch("SELECT user_id FROM referral_links ORDER BY created_at DESC LIMIT 500")
+    for r in rows:
+        try:
+            await context.bot.send_message(
+                r["user_id"],
+                "🎁 Nouvelle rediffusion disponible.\n\nObjectif : 50 invitations validées.\nVotre compteur repart à zéro pour cette nouvelle rediffusion.\nCliquez sur Mon lien pour récupérer votre lien personnel."
+            )
+        except Exception:
+            pass
 
 
 async def create_new_campaign(context: ContextTypes.DEFAULT_TYPE, reward_url: str):
@@ -1373,8 +1388,7 @@ async def create_new_campaign(context: ContextTypes.DEFAULT_TYPE, reward_url: st
     title = old["title"] if old else "Rediffusion complète du groupe"
     text = old["text"] if old else "🎁 Partagez votre lien pour recevoir la rediffusion complète du groupe."
     photo = old["photo_file_id"] if old else None
-    default_objective = int(await get_setting("campaign_default_objective", "50") or "50")
-    objective = int(old["objective"] or default_objective) if old else default_objective
+    objective = int(old["objective"] or 50) if old else 50
 
     async with db_pool.acquire() as con:
         await con.execute("UPDATE reward_campaigns SET active=FALSE, updated_at=NOW() WHERE active=TRUE")
@@ -1390,27 +1404,450 @@ async def create_new_campaign(context: ContextTypes.DEFAULT_TYPE, reward_url: st
 
 async def campaign_status_text(user_id: int):
     campaign = await get_active_campaign()
+    link = None
     objective = int(campaign["objective"] or 50)
     progress = await get_campaign_progress(user_id, campaign)
     unlocked = await user_campaign_unlocked(user_id, campaign)
 
     async with db_pool.acquire() as con:
         row = await con.fetchrow("SELECT invite_link FROM referral_links WHERE user_id=$1", user_id)
-        link = row["invite_link"] if row else None
+        if row:
+            link = row["invite_link"]
 
     txt = (
         "🎁 Rediffusion complète du groupe\n\n"
         f"Objectif : {objective} invitations validées\n"
         f"Votre progression : {progress}/{objective}\n\n"
     )
-
     if link:
         txt += f"Votre lien personnel :\n{link}\n"
-
     if unlocked and campaign["reward_url"]:
         txt += f"\n✅ Déjà débloqué :\n{campaign['reward_url']}"
-
     return txt
+
+
+async def get_or_create_user_private_link(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    async with db_pool.acquire() as con:
+        row = await con.fetchrow("SELECT invite_link FROM referral_links WHERE user_id=$1", user_id)
+        if row and row["invite_link"]:
+            return row["invite_link"]
+
+    link = await context.bot.create_chat_invite_link(
+        GROUP_ID,
+        name=f"ref_{user_id}",
+        creates_join_request=False,
+    )
+
+    async with db_pool.acquire() as con:
+        await con.execute("""
+        INSERT INTO referral_links(user_id, invite_link, created_at)
+        VALUES($1,$2,NOW())
+        ON CONFLICT(user_id) DO UPDATE SET invite_link=$2
+        """, user_id, link.invite_link)
+
+    return link.invite_link
+
+
+async def build_referral_leaderboard_text(limit: int = 10):
+    async with db_pool.acquire() as con:
+        rows = await con.fetch("""
+        SELECT r.referrer_id, COUNT(*) AS total
+        FROM referrals r
+        WHERE r.validated_at IS NOT NULL
+        GROUP BY r.referrer_id
+        ORDER BY total DESC
+        LIMIT $1
+        """, limit)
+
+    if not rows:
+        return None
+
+    lines = ["🏆 Meilleurs partageurs", ""]
+    rank = 1
+    for r in rows:
+        uid = str(r["referrer_id"])
+        masked = uid[:2] + "****"
+        lines.append(f"{rank}. {masked} : {r['total']}")
+        rank += 1
+
+    lines.append("")
+    lines.append("Les meilleurs partageurs peuvent recevoir un accès VIP gratuit.")
+    return "\n".join(lines)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    payload = context.args[0] if context.args else ""
+    if payload == "share":
+        user = update.effective_user
+        link = await get_or_create_user_private_link(context, user.id)
+        await update.message.reply_text(await campaign_status_text(user.id))
+        return
+
+    user = update.effective_user
+    if not user:
+        return
+
+    args = context.args or []
+
+    if args and args[0] == "getlink":
+        await send_referral_link_private(update, context)
+        return
+
+    if is_admin(user.id):
+        await set_admin_state(user.id, None)
+        await update.message.reply_text(await panel_text(), reply_markup=await main_keyboard())
+    else:
+        await update.message.reply_text("Clique sur le bouton dans le groupe pour recevoir ton lien privé.")
+
+
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    if not q.from_user or not is_admin(q.from_user.id):
+        return
+
+    data = q.data
+
+    if data.startswith("toggle:"):
+        key = data.split(":", 1)[1]
+        current = await get_setting(key, "off")
+        new = "off" if current == "on" else "on"
+        await set_setting(key, new)
+        await show_panel(q, f"{key} = {new.upper()}")
+        return
+
+    if data == "info":
+        await set_admin_state(q.from_user.id, None)
+        await show_panel(q, "infos actualisées")
+        return
+
+    if data == "open_group":
+        await open_group(context)
+        await show_panel(q, "session ouverte")
+        return
+
+    if data == "close_group":
+        deleted = await close_group_and_clean(context)
+        await show_panel(q, f"session fermée, {deleted} messages supprimés")
+        return
+
+    if data == "publish_ad_locked":
+        await q.answer("Il faut d'abord uploader 60 vidéos.", show_alert=True)
+        return
+
+    if data == "publish_ad":
+        ok = await publish_ad(context)
+        await show_panel(q, "publicité publiée" if ok else "60 vidéos requises")
+        return
+
+    if data == "words_menu":
+        await safe_edit(q, "🚫 MOTS INTERDITS\n\nChoisis une action :", reply_markup=await words_keyboard())
+        return
+
+    if data == "word_add":
+        await set_admin_state(q.from_user.id, "adding_word")
+        await safe_edit(q, "➕ Envoie maintenant le mot à interdire en privé.", reply_markup=back_keyboard())
+        return
+
+    if data == "word_delete":
+        await set_admin_state(q.from_user.id, "deleting_word")
+        await safe_edit(q, "➖ Envoie maintenant le mot à supprimer en privé.", reply_markup=back_keyboard())
+        return
+
+    if data == "word_list":
+        async with db_pool.acquire() as con:
+            rows = await con.fetch("SELECT word FROM banned_words ORDER BY word")
+        words = "\n".join([f"• {r['word']}" for r in rows]) or "Aucun mot interdit."
+        await safe_edit(q, f"📋 MOTS INTERDITS\n\n{words}", reply_markup=await words_keyboard())
+        return
+
+
+    if data == "toggle_raid":
+        current = await get_setting("raid_mode", "off")
+        new = "off" if current == "on" else "on"
+        await set_setting("raid_mode", new)
+        await show_panel(q, f"mode RAID = {new.upper()}")
+        return
+
+    if data == "rules_set":
+        await set_admin_state(q.from_user.id, "setting_rules")
+        await safe_edit(q, "📌 Envoie maintenant le texte des règles.", reply_markup=back_keyboard())
+        return
+
+    if data == "broadcast_set":
+        await set_admin_state(q.from_user.id, "broadcast_group")
+        await safe_edit(q, "📣 Envoie maintenant le message à publier dans le groupe.", reply_markup=back_keyboard())
+        return
+
+    if data == "ban_hash_set":
+        await set_admin_state(q.from_user.id, "ban_hash")
+        await safe_edit(q, "🚫 Envoie maintenant la photo ou vidéo à bannir par hash.", reply_markup=back_keyboard())
+        return
+
+    if data == "set_ad1_text":
+        await set_admin_state(q.from_user.id, "set_ad1_text")
+        await safe_edit(q, "✏️ Envoie maintenant le texte de la Publicité 1.", reply_markup=back_keyboard())
+        return
+
+    if data == "set_ad2_text":
+        await set_admin_state(q.from_user.id, "set_ad2_text")
+        await safe_edit(q, "✏️ Envoie maintenant le texte de la Publicité 2.", reply_markup=back_keyboard())
+        return
+
+    if data == "set_share_ad":
+        await set_admin_state(q.from_user.id, "set_share_ad")
+        await safe_edit(q, "🖼️ Envoie maintenant la pub image avec son texte en légende. Le bouton sera : Mon lien.", reply_markup=back_keyboard())
+        return
+
+    if data == "publish_share_ad":
+        await publish_share_ad(context)
+        await safe_edit(q, await panel_text("Pub Mon lien publiée"), reply_markup=await main_keyboard())
+        return
+
+    if data == "campaign_menu":
+        c = await get_active_campaign()
+        text = (
+            "🎁 CAMPAGNE REDIFFUSION\n\n"
+            f"Objectif : {c['objective']} invitations\n"
+            f"Lien GoFile : {'✅ configuré' if c['reward_url'] else '❌ manquant'}\n"
+            f"Image : {'✅ configurée' if c['photo_file_id'] else '❌ manquante'}\n\n"
+            "Modifier :"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Texte", callback_data="campaign_set_text"), InlineKeyboardButton("🖼️ Image", callback_data="campaign_set_image")],
+            [InlineKeyboardButton("🔗 Nouveau lien GoFile", callback_data="campaign_set_link")],
+            [InlineKeyboardButton("📣 Publier campagne", callback_data="publish_campaign_ad")],
+            [InlineKeyboardButton("⬅️ Retour", callback_data="info")]
+        ])
+        await safe_edit(q, text, reply_markup=kb)
+        return
+
+    if data == "campaign_set_text":
+        await set_admin_state(q.from_user.id, "campaign_set_text")
+        await safe_edit(q, "✏️ Envoie le texte de la campagne rediffusion.", reply_markup=back_keyboard())
+        return
+
+    if data == "campaign_set_image":
+        await set_admin_state(q.from_user.id, "campaign_set_image")
+        await safe_edit(q, "🖼️ Envoie l'image de la campagne rediffusion.", reply_markup=back_keyboard())
+        return
+
+    if data == "campaign_set_link":
+        await set_admin_state(q.from_user.id, "campaign_set_link")
+        await safe_edit(q, "🔗 Envoie le nouveau lien GoFile.\n\nAttention : cela crée une nouvelle campagne et remet les compteurs à zéro.", reply_markup=back_keyboard())
+        return
+
+    if data == "publish_campaign_ad":
+        await publish_campaign_ad(context)
+        await safe_edit(q, await panel_text("Campagne publiée"), reply_markup=await main_keyboard())
+        return
+
+    if data == "reward_links_menu":
+        await safe_edit(q, "🔗 LIENS RÉCOMPENSES\n\nChoisis le lien à modifier.", reply_markup=await reward_links_keyboard())
+        return
+
+    if data.startswith("set_reward_link:"):
+        level = data.split(":", 1)[1]
+        await set_admin_state(q.from_user.id, f"set_reward_link:{level}")
+        await safe_edit(q, f"🔗 Envoie maintenant le lien pour le palier {level}.", reply_markup=back_keyboard())
+        return
+
+    if data == "show_reward_links":
+        async with db_pool.acquire() as con:
+            rows = await con.fetch("SELECT level,url FROM reward_links ORDER BY level")
+        txt = "🔗 LIENS RÉCOMPENSES\n\n" + "\n".join([f"{r['level']} : {r['url'] or '❌ vide'}" for r in rows])
+        await safe_edit(q, txt, reply_markup=await reward_links_keyboard())
+        return
+
+    if data == "warn_non_participants":
+        count = await warn_non_participants(context)
+        await show_panel(q, f"{count} non-participant(s) averti(s)")
+        return
+    if data == "ref_stats":
+        async with db_pool.acquire() as con:
+            rows = await con.fetch("""
+            SELECT referrer_id, COUNT(*) AS total
+            FROM referrals
+            WHERE validated_at IS NOT NULL
+            GROUP BY referrer_id
+            ORDER BY total DESC
+            LIMIT 20
+            """)
+        if not rows:
+            txt = "📊 STATS PARRAINAGE\n\nAucun parrainage validé."
+        else:
+            txt = "📊 STATS PARRAINAGE\n\n" + "\n".join([f"• {r['referrer_id']} : {r['total']}" for r in rows])
+        await safe_edit(q, txt, reply_markup=back_keyboard())
+        return
+
+
+# ---------------- GROUP OPEN / CLOSE ----------------
+
+async def open_group(context: ContextTypes.DEFAULT_TYPE):
+    await reset_session_moderation_counters()
+    await delete_last_system_message(context)
+
+    sid = await create_session()
+    await set_setting("group_open", "on")
+
+    perms = ChatPermissions(
+        can_send_messages=True,
+        can_send_audios=True,
+        can_send_documents=True,
+        can_send_photos=True,
+        can_send_videos=True,
+        can_send_video_notes=True,
+        can_send_voice_notes=True,
+    )
+
+    await context.bot.set_chat_permissions(GROUP_ID, perms)
+    await send_system_message(context, "🟢 Groupe ouvert, vous pouvez envoyer tous vos médias.", "open", record_in_session=True)
+    print(f"SESSION OPEN {sid}", flush=True)
+
+
+
+
+async def send_trusted_session_report(context: ContextTypes.DEFAULT_TYPE, session_id: int, deleted_count: int):
+    if not session_id:
+        return
+
+    async with db_pool.acquire() as con:
+        rows = await con.fetch("""
+        SELECT trusted_id, action, COUNT(*) AS total
+        FROM trusted_actions
+        WHERE session_id=$1
+        GROUP BY trusted_id, action
+        ORDER BY trusted_id, action
+        """, session_id)
+
+        strikes = await con.fetch("""
+        SELECT target_user_id, strikes
+        FROM trusted_strikes
+        WHERE session_id=$1
+        ORDER BY strikes DESC
+        LIMIT 20
+        """, session_id)
+
+    by_user = {}
+    for r in rows:
+        tid = r["trusted_id"]
+        by_user.setdefault(tid, {"supprime": 0, "ban": 0})
+        by_user[tid][r["action"]] = r["total"]
+
+    lines = [
+        f"📊 Bilan modération trusted — Session #{session_id}",
+        "",
+        f"🧹 Messages supprimés à la fermeture : {deleted_count}",
+        "",
+    ]
+
+    if not by_user:
+        lines.append("Aucune action trusted pendant cette session.")
+    else:
+        for tid, data in by_user.items():
+            sup = data.get("supprime", 0)
+            ban = data.get("ban", 0)
+            sup_limit = " ⚠️ limite atteinte" if sup >= 20 else ""
+            ban_limit = " ⚠️ limite atteinte" if ban >= 20 else ""
+            lines.append(f"👤 Trusted ID {tid}")
+            lines.append(f"• /supprime : {sup}{sup_limit}")
+            lines.append(f"• /ban : {ban}{ban_limit}")
+            lines.append("")
+
+    if strikes:
+        lines.append("🎯 Utilisateurs avec strikes :")
+        for s in strikes:
+            lines.append(f"• {s['target_user_id']} : {s['strikes']} strike(s)")
+
+    text = "\n".join(lines)
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin_id, text)
+        except Exception as e:
+            print(f"TRUSTED REPORT SKIPPED admin={admin_id}: admin must start the bot in private first ({e})", flush=True)
+
+async def close_group_and_clean(context: ContextTypes.DEFAULT_TYPE):
+    sid = await current_session_id()
+    await set_setting("group_open", "off")
+
+    try:
+        await context.bot.set_chat_permissions(GROUP_ID, ChatPermissions(can_send_messages=False))
+    except Exception as e:
+        print(f"SET PERMS CLOSE ERROR: {e}", flush=True)
+
+    if sid:
+        async with db_pool.acquire() as con:
+            rows = await con.fetch("""
+            SELECT chat_id, message_id
+            FROM messages
+            WHERE chat_id=$1 AND session_id=$2
+            ORDER BY created_at ASC
+            """, GROUP_ID, sid)
+    else:
+        async with db_pool.acquire() as con:
+            rows = await con.fetch("""
+            SELECT chat_id, message_id
+            FROM messages
+            WHERE chat_id=$1
+            ORDER BY created_at ASC
+            """, GROUP_ID)
+
+    deleted = 0
+    for r in rows:
+        ok = await delete_message_safe(context, r["chat_id"], r["message_id"])
+        if ok:
+            deleted += 1
+        await asyncio.sleep(0.04)
+
+    await delete_last_system_message(context)
+
+    async with db_pool.acquire() as con:
+        if sid:
+            await con.execute("DELETE FROM messages WHERE chat_id=$1 AND session_id=$2", GROUP_ID, sid)
+        else:
+            await con.execute("DELETE FROM messages WHERE chat_id=$1", GROUP_ID)
+
+    await close_session()
+
+    await send_system_message(
+        context,
+        "🔴 Groupe fermé, vous ne pouvez plus envoyer.",
+        "closed",
+        record_in_session=False,
+    )
+
+    await send_trusted_session_report(context, sid, deleted)
+    return deleted
+
+
+# ---------------- PUBLICITY / REFERRAL ----------------
+
+async def publish_ad(context: ContextTypes.DEFAULT_TYPE):
+    if not await reward_links_ready():
+        return False
+
+    old_id = int(await get_setting("ad_message_id", "0") or "0")
+    if old_id:
+        await delete_message_safe(context, GROUP_ID, old_id)
+
+    text = (
+        "🎁 Partagez votre lien pour recevoir la rediffusion complète du groupe.\n\n"
+        "\n"
+        "\n"
+        "\n"
+        "\n\n"
+        "Cliquez ci-dessous pour recevoir votre lien personnel."
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎁 Recevoir mon lien privé", url=bot_start_url())]
+    ])
+
+    msg = await context.bot.send_message(GROUP_ID, text, reply_markup=keyboard)
+    await set_setting("ad_message_id", msg.message_id)
+    return True
 
 
 async def send_referral_link_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1422,9 +1859,8 @@ async def send_referral_link_private(update: Update, context: ContextTypes.DEFAU
             await update.message.reply_text("❌ Ton accès au parrainage est bloqué.")
             return
 
-    invite_link = await get_or_create_user_private_link(context, user.id)
-    txt = await campaign_status_text(user.id)
-    await update.message.reply_text(txt)
+    await get_or_create_user_private_link(context, user.id)
+    await update.message.reply_text(await campaign_status_text(user.id))
 
 
 async def validate_join_later(context: ContextTypes.DEFAULT_TYPE, invited_user_id: int):
@@ -1574,25 +2010,6 @@ async def handle_private_admin(update: Update, context: ContextTypes.DEFAULT_TYP
             await con.execute("UPDATE reward_campaigns SET photo_file_id=$1, updated_at=NOW() WHERE active=TRUE", msg.photo[-1].file_id)
         await set_admin_state(user.id, None)
         await msg.reply_text("✅ Image campagne mise à jour.")
-        return
-
-    if state == "campaign_set_objective":
-        try:
-            objective = int(text)
-        except Exception:
-            await msg.reply_text("❌ Envoie un nombre valide. Exemple : 50")
-            return
-
-        if objective < 1 or objective > 10000:
-            await msg.reply_text("❌ Objectif invalide.")
-            return
-
-        await set_setting("campaign_default_objective", str(objective))
-        await ensure_active_campaign()
-        async with db_pool.acquire() as con:
-            await con.execute("UPDATE reward_campaigns SET objective=$1, updated_at=NOW() WHERE active=TRUE", objective)
-        await set_admin_state(user.id, None)
-        await msg.reply_text(f"✅ Objectif mis à jour : {objective} invitations validées.")
         return
 
     if state == "campaign_set_link":
