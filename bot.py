@@ -2490,7 +2490,7 @@ async def trusted_pasfr(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # PUBLIC MESSAGES V24
 # =========================
 
-MSG_PARTICIPATION_REQUIRED = "⚠️ Merci de participer avant d’envoyer un message.\nEnvoyez au moins 1 photo ou 1 vidéo jamais publiée."
+MSG_PARTICIPATION_REQUIRED = "⚠️ Merci de participer avant d’envoyer un message."
 MSG_REPOST = "♻️ Ce média a déjà été publié."
 MSG_LINK_FORBIDDEN = "🔗 Les liens ne sont pas autorisés."
 MSG_FORWARD_FORBIDDEN = "🚫 Les transferts ne sont pas autorisés."
